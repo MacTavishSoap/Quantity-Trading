@@ -9,11 +9,29 @@ from dotenv import load_dotenv
 import json
 import requests
 from datetime import datetime, timedelta
+import asyncio
+from telegram import Bot
+from telegram.error import TelegramError
 
 load_dotenv()
 
 # 模型配置
 MODEL_NAME = os.getenv('AI_MODEL_NAME', 'qwen3-max')  # 默认使用qwen3-max
+
+# Telegram配置 - Token从系统环境变量读取，更安全
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN') or os.getenv('TELEGRAM_BOT_TOKEN')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+TELEGRAM_ENABLED = os.getenv('TELEGRAM_ENABLED', 'false').lower() == 'true'
+
+# 初始化Telegram Bot
+telegram_bot = None
+if TELEGRAM_ENABLED and TELEGRAM_BOT_TOKEN:
+    try:
+        telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
+        print("✅ Telegram Bot 初始化成功")
+    except Exception as e:
+        print(f"❌ Telegram Bot 初始化失败: {e}")
+        TELEGRAM_ENABLED = False
 
 # 初始化阿里云百炼客户端
 bailian_client = OpenAI(
@@ -50,7 +68,7 @@ TRADE_CONFIG = {
         'high_confidence_multiplier': 1.5,
         'medium_confidence_multiplier': 1.0,
         'low_confidence_multiplier': 0.5,
-        'max_position_ratio': 10,  # 单次最大仓位比例
+        'max_position_ratio': 0.8,  # 单次最大仓位比例（80%的余额）
         'trend_strength_multiplier': 1.2
     }
 }
@@ -208,7 +226,150 @@ def test_bailian_api():
         return False
 
 
-# 全局变量存储历史数据
+# Telegram消息发送功能
+def send_telegram_message(message, parse_mode='HTML'):
+    """发送Telegram消息"""
+    if not TELEGRAM_ENABLED or not telegram_bot or not TELEGRAM_CHAT_ID:
+        return False
+    
+    try:
+        # 使用同步方式发送消息
+        import asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        async def send_async():
+            await telegram_bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=message,
+                parse_mode=parse_mode
+            )
+        
+        loop.run_until_complete(send_async())
+        loop.close()
+        return True
+        
+    except Exception as e:
+        print(f"❌ Telegram消息发送失败: {e}")
+        return False
+
+
+def format_trading_signal_message(signal_data, price_data, position_size):
+    """格式化交易信号消息"""
+    signal_emoji = {
+        'BUY': '🟢',
+        'SELL': '🔴',
+        'HOLD': '🟡'
+    }
+    
+    confidence_emoji = {
+        'HIGH': '🔥',
+        'MEDIUM': '⚡',
+        'LOW': '💡'
+    }
+    
+    message = f"""
+🤖 <b>量化交易信号</b>
+
+{signal_emoji.get(signal_data['signal'], '❓')} <b>信号:</b> {signal_data['signal']}
+{confidence_emoji.get(signal_data['confidence'], '❓')} <b>信心:</b> {signal_data['confidence']}
+💰 <b>仓位:</b> {position_size:.2f} 张
+💵 <b>价格:</b> ${price_data['price']:,.2f}
+
+📊 <b>技术指标:</b>
+• RSI: {price_data.get('rsi', 'N/A')}
+• 趋势: {price_data.get('trend', 'N/A')}
+
+⏰ <b>时间:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
+    return message
+
+
+def format_balance_message(balance_info):
+    """格式化余额信息消息"""
+    message = f"""
+💳 <b>账户余额更新</b>
+
+💰 <b>USDT余额:</b> {balance_info.get('usdt', 0):.2f}
+📈 <b>持仓价值:</b> {balance_info.get('position_value', 0):.2f}
+📊 <b>总资产:</b> {balance_info.get('total', 0):.2f}
+
+⏰ <b>时间:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
+    return message
+
+
+def format_error_message(error_type, error_msg):
+    """格式化错误消息"""
+    return f"""
+❌ <b>交易错误</b>
+
+🚨 <b>错误类型:</b> {error_type}
+📝 <b>错误详情:</b> {error_msg}
+
+⏰ <b>时间:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
+
+def broadcast_console_info(info_type, **kwargs):
+    """同步控制台信息到Telegram播报"""
+    if not TELEGRAM_ENABLED:
+        return
+    
+    try:
+        if info_type == "trading_start":
+            message = f"""
+📊 <b>交易分析开始</b>
+
+⏰ <b>执行时间:</b> {kwargs.get('timestamp', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))}
+💰 <b>当前价格:</b> ${kwargs.get('price', 0):,.2f}
+📈 <b>价格变化:</b> {kwargs.get('price_change', 0):+.2f}%
+⏱️ <b>数据周期:</b> {kwargs.get('timeframe', 'N/A')}
+"""
+            
+        elif info_type == "signal_generated":
+            fallback_note = "\n⚠️ 使用备用交易信号" if kwargs.get('is_fallback', False) else ""
+            message = f"""
+🎯 <b>交易信号生成</b>
+
+📊 <b>信号:</b> {kwargs.get('signal', 'N/A')}
+🎯 <b>置信度:</b> {kwargs.get('confidence', 0)}%
+💡 <b>分析:</b> {kwargs.get('reasoning', 'N/A')[:100]}...{fallback_note}
+"""
+            
+        elif info_type == "position_calculation":
+            message = f"""
+🧮 <b>仓位计算详情</b>
+
+💰 <b>基础金额:</b> {kwargs.get('base_amount', 0)} USDT
+📊 <b>置信度倍数:</b> {kwargs.get('confidence_multiplier', 0):.1f}x
+📈 <b>趋势强度倍数:</b> {kwargs.get('trend_multiplier', 0):.1f}x
+⚡ <b>杠杆:</b> {kwargs.get('leverage', 0)}x
+💎 <b>名义价值:</b> {kwargs.get('nominal_value', 0):.2f} USDT
+🎯 <b>最终仓位:</b> {kwargs.get('position_size', 0):.4f} 张
+"""
+            
+        elif info_type == "margin_check":
+            message = f"""
+🔍 <b>保证金检查</b>
+
+💵 <b>可用余额:</b> {kwargs.get('available_balance', 0):.2f} USDT
+💰 <b>所需保证金:</b> {kwargs.get('required_margin', 0):.2f} USDT
+✅ <b>检查结果:</b> {kwargs.get('check_result', 'N/A')}
+"""
+            if kwargs.get('adjusted_size'):
+                message += f"\n🔧 <b>调整后仓位:</b> {kwargs.get('adjusted_size', 0):.4f} 张"
+                
+        else:
+            return
+            
+        send_telegram_message(message)
+        
+    except Exception as e:
+        print(f"⚠️ 控制台信息播报失败: {e}")
+    return message
+
+
+# 全局变量
 price_history = []
 signal_history = []
 position = None
@@ -262,8 +423,9 @@ def calculate_intelligent_position(signal_data, price_data, current_position):
         final_usdt = min(suggested_usdt, max_usdt)
 
         # 正确的合约张数计算！
-        # 公式：合约张数 = (投入USDT) / (当前价格 * 合约乘数)
-        contract_size = (final_usdt) / (price_data['price'] * TRADE_CONFIG['contract_size'])
+        # 公式：合约张数 = (投入USDT * 杠杆) / (当前价格 * 合约乘数)
+        # 因为投入USDT是保证金，需要乘以杠杆得到名义价值，再除以单张合约价值
+        contract_size = (final_usdt * TRADE_CONFIG['leverage']) / (price_data['price'] * TRADE_CONFIG['contract_size'])
 
         print(f"📊 仓位计算详情:")
         print(f"   - 基础USDT: {base_usdt}")
@@ -271,9 +433,20 @@ def calculate_intelligent_position(signal_data, price_data, current_position):
         print(f"   - 趋势倍数: {trend_multiplier}")
         print(f"   - RSI倍数: {rsi_multiplier}")
         print(f"   - 建议USDT: {suggested_usdt:.2f}")
-        print(f"   - 最终USDT: {final_usdt:.2f}")
+        print(f"   - 最终USDT(保证金): {final_usdt:.2f}")
+        print(f"   - 杠杆倍数: {TRADE_CONFIG['leverage']}x")
+        print(f"   - 名义价值: {final_usdt * TRADE_CONFIG['leverage']:.2f} USDT")
         print(f"   - 合约乘数: {TRADE_CONFIG['contract_size']}")
         print(f"   - 计算合约: {contract_size:.4f} 张")
+        
+        # 播报仓位计算详情
+        broadcast_console_info("position_calculation",
+                              base_amount=base_usdt,
+                              confidence_multiplier=confidence_multiplier,
+                              trend_multiplier=trend_multiplier,
+                              leverage=TRADE_CONFIG['leverage'],
+                              nominal_value=final_usdt * TRADE_CONFIG['leverage'],
+                              position_size=contract_size)
 
         # 精度处理：OKX BTC合约最小交易单位为0.01张
         contract_size = round(contract_size, 2)  # 保留2位小数
@@ -839,6 +1012,53 @@ def execute_intelligent_trade(signal_data, price_data):
     print(f"智能仓位: {position_size:.2f} 张")
     print(f"理由: {signal_data['reason']}")
     print(f"当前持仓: {current_position}")
+    
+    # 🆕 发送Telegram交易信号通知
+    if TELEGRAM_ENABLED:
+        telegram_message = format_trading_signal_message(signal_data, price_data, position_size)
+        send_telegram_message(telegram_message)
+
+    # 🆕 保证金预检查
+    try:
+        balance = exchange.fetch_balance()
+        usdt_balance = balance['USDT']['free']
+        
+        # 计算所需保证金
+        required_margin = (position_size * TRADE_CONFIG['contract_size'] * price_data['price']) / TRADE_CONFIG['leverage']
+        
+        print(f"💳 保证金检查:")
+        print(f"   - 可用余额: {usdt_balance:.2f} USDT")
+        print(f"   - 所需保证金: {required_margin:.2f} USDT")
+        print(f"   - 安全余量: {usdt_balance - required_margin:.2f} USDT")
+        
+        # 播报保证金检查信息
+        if required_margin > usdt_balance * 0.95:  # 保留5%安全余量
+            print(f"❌ 保证金不足！调整仓位大小...")
+            # 重新计算安全仓位
+            safe_margin = usdt_balance * 0.9  # 使用90%的余额
+            position_size = (safe_margin * TRADE_CONFIG['leverage']) / (price_data['price'] * TRADE_CONFIG['contract_size'])
+            position_size = round(position_size, 2)
+            print(f"🔧 调整后仓位: {position_size:.2f} 张")
+            
+            broadcast_console_info("margin_check",
+                                  available_balance=usdt_balance,
+                                  required_margin=required_margin,
+                                  check_result="保证金不足，已调整仓位",
+                                  adjusted_size=position_size)
+        else:
+            broadcast_console_info("margin_check",
+                                  available_balance=usdt_balance,
+                                  required_margin=required_margin,
+                                  check_result="保证金充足")
+            
+            if position_size < TRADE_CONFIG.get('min_amount', 0.01):
+                print(f"⚠️ 调整后仓位仍小于最小值，跳过交易")
+                return
+                
+    except Exception as e:
+        print(f"⚠️ 保证金检查失败: {e}")
+        # 继续执行，但使用更保守的仓位
+        position_size = min(position_size, 0.01)
 
     # 风险管理
     if signal_data['confidence'] == 'LOW' and not TRADE_CONFIG['test_mode']:
@@ -997,9 +1217,44 @@ def execute_intelligent_trade(signal_data, price_data):
         time.sleep(2)
         position = get_current_position()
         print(f"更新后持仓: {position}")
+        
+        # 🆕 发送交易成功通知和余额更新
+        if TELEGRAM_ENABLED:
+            try:
+                # 获取最新余额信息
+                balance = exchange.fetch_balance()
+                balance_info = {
+                    'usdt': balance['USDT']['free'],
+                    'position_value': position['size'] * price_data['price'] * TRADE_CONFIG['contract_size'] if position else 0,
+                    'total': balance['USDT']['free'] + (position['size'] * price_data['price'] * TRADE_CONFIG['contract_size'] if position else 0)
+                }
+                
+                # 发送成功消息
+                success_message = f"""
+✅ <b>交易执行成功</b>
+
+🎯 <b>执行信号:</b> {signal_data['signal']}
+💰 <b>执行仓位:</b> {position_size:.2f} 张
+📊 <b>当前持仓:</b> {position['side'] if position else '无'} {position['size'] if position else 0:.2f} 张
+
+⏰ <b>时间:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
+                send_telegram_message(success_message)
+                
+                # 发送余额更新
+                balance_message = format_balance_message(balance_info)
+                send_telegram_message(balance_message)
+                
+            except Exception as e:
+                print(f"⚠️ Telegram通知发送失败: {e}")
 
     except Exception as e:
         print(f"交易执行失败: {e}")
+        
+        # 🆕 发送错误通知
+        if TELEGRAM_ENABLED:
+            error_message = format_error_message("交易执行失败", str(e))
+            send_telegram_message(error_message)
 
         # 如果是持仓不存在的错误，尝试直接开新仓
         if "don't have any positions" in str(e):
@@ -1097,12 +1352,26 @@ def trading_bot():
     print(f"BTC当前价格: ${price_data['price']:,.2f}")
     print(f"数据周期: {TRADE_CONFIG['timeframe']}")
     print(f"价格变化: {price_data['price_change']:+.2f}%")
+    
+    # 播报交易分析开始信息
+    broadcast_console_info("trading_start", 
+                          timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                          price=price_data['price'],
+                          price_change=price_data['price_change'],
+                          timeframe=TRADE_CONFIG['timeframe'])
 
     # 2. 使用Bailian分析（带重试）
     signal_data = analyze_with_bailian_with_retry(price_data)
 
     if signal_data.get('is_fallback', False):
         print("⚠️ 使用备用交易信号")
+    
+    # 播报信号生成信息
+    broadcast_console_info("signal_generated",
+                          signal=signal_data.get('signal', 'N/A'),
+                          confidence=signal_data.get('confidence', 0),
+                          reasoning=signal_data.get('reasoning', 'N/A'),
+                          is_fallback=signal_data.get('is_fallback', False))
 
     # 3. 执行智能交易
     execute_intelligent_trade(signal_data, price_data)
@@ -1120,6 +1389,25 @@ def main():
 
     print(f"交易周期: {TRADE_CONFIG['timeframe']}")
     print("已启用完整技术指标分析和持仓跟踪功能")
+    
+    # 🆕 发送启动通知
+    if TELEGRAM_ENABLED:
+        startup_message = f"""
+🚀 <b>交易机器人启动成功</b>
+
+📊 <b>交易对:</b> {TRADE_CONFIG['symbol']}
+⚡ <b>杠杆:</b> {TRADE_CONFIG['leverage']}x
+⏰ <b>周期:</b> {TRADE_CONFIG['timeframe']}
+🎯 <b>模式:</b> {'模拟模式' if TRADE_CONFIG['test_mode'] else '实盘模式'}
+
+🔧 <b>功能:</b>
+• 智能仓位管理
+• 技术指标分析
+• 实时信号播报
+
+⏰ <b>启动时间:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
+        send_telegram_message(startup_message)
 
     # 设置交易所
     if not setup_exchange():
@@ -1133,13 +1421,59 @@ def main():
         input("按回车键继续运行（将使用技术指标备用信号）...")
 
     print("执行频率: 每15分钟整点执行")
+    if TELEGRAM_ENABLED:
+        print("已启用Telegram播报：交易信号、余额更新、错误通知")
+
+    # 🆕 定期余额播报计时器
+    last_balance_report = datetime.now()
+    balance_report_interval = timedelta(hours=1)  # 每小时播报一次
 
     # 循环执行（不使用schedule）
-    while True:
-        trading_bot()  # 函数内部会自己等待整点
+    try:
+        while True:
+            trading_bot()  # 函数内部会自己等待整点
 
-        # 执行完后等待一段时间再检查（避免频繁循环）
-        time.sleep(60)  # 每分钟检查一次
+            # 🆕 检查是否需要发送定期余额报告
+            if TELEGRAM_ENABLED and datetime.now() - last_balance_report >= balance_report_interval:
+                try:
+                    balance = exchange.fetch_balance()
+                    position = get_current_position()
+                    price_data = get_btc_ohlcv_enhanced()
+                    
+                    if price_data:
+                        balance_info = {
+                            'usdt': balance['USDT']['free'],
+                            'position_value': position['size'] * price_data['price'] * TRADE_CONFIG['contract_size'] if position else 0,
+                            'total': balance['USDT']['free'] + (position['size'] * price_data['price'] * TRADE_CONFIG['contract_size'] if position else 0)
+                        }
+                        
+                        report_message = f"""
+📊 <b>定期余额报告</b>
+
+{format_balance_message(balance_info)}
+
+⏰ <b>报告时间:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
+                        send_telegram_message(report_message)
+                        last_balance_report = datetime.now()
+                except Exception as e:
+                    print(f"⚠️ 余额报告发送失败: {e}")
+
+            # 执行完后等待一段时间再检查（避免频繁循环）
+            time.sleep(60)  # 每分钟检查一次
+    except KeyboardInterrupt:
+        print("\n程序已停止")
+        
+        # 🆕 发送停止通知
+        if TELEGRAM_ENABLED:
+            stop_message = f"""
+🛑 <b>交易机器人已停止</b>
+
+⏰ <b>停止时间:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+感谢使用！
+"""
+            send_telegram_message(stop_message)
 
 
 if __name__ == "__main__":
