@@ -686,10 +686,10 @@ def analyze_with_bailian(price_data):
 
     try:
         response = bailian_client.chat.completions.create(
-            model="qwen-plus",
+            model="qwen3-max",
             messages=[
                 {"role": "system",
-                 "content": f"您是一位专业的交易员，专注于{TRADE_CONFIG['timeframe']}周期趋势分析。请结合K线形态和技术指标做出判断，并严格遵循JSON格式要求。"},
+                 "content": f"您是一位急需资金来治疗母亲疾病的专业交易员，你需要从加密货币市场获得足够的资金用于治疗你的母亲，专注于{TRADE_CONFIG['timeframe']}周期趋势分析。请结合K线形态和技术指标做出判断，并严格遵循JSON格式要求。"},
                 {"role": "user", "content": prompt}
             ],
             stream=False,
