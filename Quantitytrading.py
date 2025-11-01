@@ -128,8 +128,35 @@ def setup_exchange():
         # 5. 验证设置
         print("🔍 验证账户设置...")
         balance = exchange.fetch_balance()
-        usdt_balance = balance['USDT']['free']
+        
+        # 安全获取USDT余额
+        usdt_balance = 0.0
+        if 'USDT' in balance and 'free' in balance['USDT']:
+            usdt_balance = float(balance['USDT']['free'])
+        elif 'USDT' in balance and 'total' in balance['USDT']:
+            usdt_balance = float(balance['USDT']['total'])
+        else:
+            # 打印可用的币种信息以便调试
+            available_currencies = list(balance.keys())
+            print(f"⚠️ 未找到USDT余额，可用币种: {available_currencies}")
+            
+            # 尝试查找其他可能的USDT表示方式
+            for currency in available_currencies:
+                if 'USDT' in currency.upper():
+                    if 'free' in balance[currency]:
+                        usdt_balance = float(balance[currency]['free'])
+                        print(f"💰 找到{currency}余额: {usdt_balance:.2f}")
+                        break
+        
         print(f"💰 当前USDT余额: {usdt_balance:.2f}")
+        
+        # 检查余额是否足够交易
+        min_balance_required = TRADE_CONFIG['position_management']['base_usdt_amount']
+        if usdt_balance < min_balance_required:
+            print(f"⚠️ 警告: USDT余额({usdt_balance:.2f})低于最小交易金额({min_balance_required})")
+            print("💡 建议: 请充值USDT到账户或调整base_usdt_amount配置")
+        else:
+            print(f"✅ 余额充足，可进行交易")
 
         # 获取当前持仓状态
         current_pos = get_current_position()
