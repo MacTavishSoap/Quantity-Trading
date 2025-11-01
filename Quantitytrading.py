@@ -28,8 +28,10 @@ telegram_bot = None
 if TELEGRAM_ENABLED and TELEGRAM_BOT_TOKEN:
     try:
         telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
+        # 这里不使用dual_output，因为函数还未定义，使用普通print
         print("✅ Telegram Bot 初始化成功")
     except Exception as e:
+        # 这里不使用dual_output，因为函数还未定义，使用普通print
         print(f"❌ Telegram Bot 初始化失败: {e}")
         TELEGRAM_ENABLED = False
 
@@ -70,6 +72,22 @@ TRADE_CONFIG = {
         'low_confidence_multiplier': 0.5,
         'max_position_ratio': 0.8,  # 单次最大仓位比例（80%的余额）
         'trend_strength_multiplier': 1.2
+    },
+    # 🛡️ 风险控制参数 - 防黑天鹅和插针
+    'risk_management': {
+        'enable_anomaly_detection': True,  # 启用价格异常检测
+        'max_price_change_1m': 0.05,  # 1分钟最大价格变化（5%）
+        'max_price_change_5m': 0.10,  # 5分钟最大价格变化（10%）
+        'max_volatility_threshold': 0.15,  # 最大波动率阈值（15%）
+        'circuit_breaker_enabled': True,  # 启用熔断机制
+        'max_consecutive_losses': 3,  # 最大连续亏损次数
+        'max_daily_loss_ratio': 0.20,  # 最大日亏损比例（20%）
+        'slippage_protection': True,  # 启用滑点保护
+        'max_slippage_ratio': 0.005,  # 最大滑点比例（0.5%）
+        'emergency_stop_enabled': True,  # 启用紧急停止
+        'price_deviation_threshold': 0.03,  # 价格偏差阈值（3%）
+        'volatility_window': 20,  # 波动率计算窗口（分钟）
+        'anomaly_cooldown': 300  # 异常检测后的冷却时间（秒）
     }
 }
 
@@ -254,6 +272,60 @@ def send_telegram_message(message, parse_mode='HTML'):
         return False
 
 
+def dual_output(message, telegram_enabled=True, console_prefix="", telegram_parse_mode='HTML'):
+    """
+    统一输出函数：同时输出到控制台和Telegram
+    
+    Args:
+        message: 要输出的消息内容
+        telegram_enabled: 是否发送到Telegram（默认True）
+        console_prefix: 控制台输出的前缀（可选）
+        telegram_parse_mode: Telegram消息解析模式
+    """
+    # 输出到控制台
+    console_message = f"{console_prefix}{message}" if console_prefix else message
+    print(console_message)
+    
+    # 同时发送到Telegram（如果启用）
+    if telegram_enabled and TELEGRAM_ENABLED:
+        # 清理HTML标签用于Telegram显示
+        telegram_message = message
+        if telegram_parse_mode == 'HTML':
+            # 保持HTML格式
+            pass
+        else:
+            # 移除HTML标签用于纯文本显示
+            import re
+            telegram_message = re.sub(r'<[^>]+>', '', message)
+        
+        send_telegram_message(telegram_message, telegram_parse_mode)
+
+
+def log_info(message, telegram_enabled=True):
+    """记录信息日志（同时输出到控制台和Telegram）"""
+    dual_output(f"ℹ️ {message}", telegram_enabled, "")
+
+
+def log_success(message, telegram_enabled=True):
+    """记录成功日志（同时输出到控制台和Telegram）"""
+    dual_output(f"✅ {message}", telegram_enabled, "")
+
+
+def log_warning(message, telegram_enabled=True):
+    """记录警告日志（同时输出到控制台和Telegram）"""
+    dual_output(f"⚠️ {message}", telegram_enabled, "")
+
+
+def log_error(message, telegram_enabled=True):
+    """记录错误日志（同时输出到控制台和Telegram）"""
+    dual_output(f"❌ {message}", telegram_enabled, "")
+
+
+def log_trading(message, telegram_enabled=True):
+    """记录交易相关日志（同时输出到控制台和Telegram）"""
+    dual_output(f"📊 {message}", telegram_enabled, "")
+
+
 def format_trading_signal_message(signal_data, price_data, position_size):
     """格式化交易信号消息"""
     signal_emoji = {
@@ -374,6 +446,224 @@ price_history = []
 signal_history = []
 position = None
 
+# 🛡️ 风险控制全局变量
+risk_state = {
+    'consecutive_losses': 0,  # 连续亏损次数
+    'daily_pnl': 0.0,  # 当日盈亏
+    'last_anomaly_time': 0,  # 上次异常检测时间
+    'circuit_breaker_active': False,  # 熔断状态
+    'emergency_stop': False,  # 紧急停止状态
+    'trading_suspended': False,  # 交易暂停状态
+    'last_price_check': None,  # 上次价格检查
+    'volatility_history': []  # 波动率历史
+}
+
+
+# 🛡️ 风险控制函数
+
+def detect_price_anomaly(current_price, price_history):
+    """检测价格异常（插针、闪崩等）"""
+    global risk_state
+    
+    risk_config = TRADE_CONFIG['risk_management']
+    if not risk_config.get('enable_anomaly_detection', True):
+        return False, "异常检测已禁用"
+    
+    current_time = time.time()
+    
+    # 检查冷却时间
+    if current_time - risk_state['last_anomaly_time'] < risk_config['anomaly_cooldown']:
+        return False, "异常检测冷却中"
+    
+    if len(price_history) < 5:
+        return False, "价格历史数据不足"
+    
+    try:
+        # 获取最近的价格数据
+        recent_prices = [p['price'] for p in price_history[-5:]]
+        
+        # 1分钟价格变化检测
+        if len(recent_prices) >= 2:
+            price_change_1m = abs(current_price - recent_prices[-1]) / recent_prices[-1]
+            if price_change_1m > risk_config['max_price_change_1m']:
+                risk_state['last_anomaly_time'] = current_time
+                return True, f"1分钟价格异常变化: {price_change_1m:.2%}"
+        
+        # 5分钟价格变化检测
+        if len(recent_prices) >= 5:
+            price_change_5m = abs(current_price - recent_prices[0]) / recent_prices[0]
+            if price_change_5m > risk_config['max_price_change_5m']:
+                risk_state['last_anomaly_time'] = current_time
+                return True, f"5分钟价格异常变化: {price_change_5m:.2%}"
+        
+        # 价格偏差检测（与均价比较）
+        avg_price = sum(recent_prices) / len(recent_prices)
+        price_deviation = abs(current_price - avg_price) / avg_price
+        if price_deviation > risk_config['price_deviation_threshold']:
+            risk_state['last_anomaly_time'] = current_time
+            return True, f"价格偏差异常: {price_deviation:.2%}"
+        
+        return False, "价格正常"
+        
+    except Exception as e:
+        log_error(f"价格异常检测失败: {e}")
+        return False, "检测失败"
+
+
+def calculate_volatility(price_history, window=20):
+    """计算价格波动率"""
+    if len(price_history) < window:
+        return 0.0
+    
+    try:
+        prices = [p['price'] for p in price_history[-window:]]
+        returns = []
+        
+        for i in range(1, len(prices)):
+            ret = (prices[i] - prices[i-1]) / prices[i-1]
+            returns.append(ret)
+        
+        if not returns:
+            return 0.0
+        
+        # 计算标准差作为波动率
+        mean_return = sum(returns) / len(returns)
+        variance = sum((r - mean_return) ** 2 for r in returns) / len(returns)
+        volatility = variance ** 0.5
+        
+        return volatility
+        
+    except Exception as e:
+        log_error(f"波动率计算失败: {e}")
+        return 0.0
+
+
+def check_volatility_protection(price_history):
+    """检查波动率保护"""
+    risk_config = TRADE_CONFIG['risk_management']
+    
+    volatility = calculate_volatility(price_history, risk_config['volatility_window'])
+    risk_state['volatility_history'].append(volatility)
+    
+    # 保持波动率历史长度
+    if len(risk_state['volatility_history']) > 100:
+        risk_state['volatility_history'] = risk_state['volatility_history'][-100:]
+    
+    if volatility > risk_config['max_volatility_threshold']:
+        return True, f"波动率过高: {volatility:.2%}"
+    
+    return False, f"波动率正常: {volatility:.2%}"
+
+
+def check_circuit_breaker():
+    """检查熔断机制"""
+    global risk_state
+    
+    risk_config = TRADE_CONFIG['risk_management']
+    if not risk_config.get('circuit_breaker_enabled', True):
+        return False, "熔断机制已禁用"
+    
+    # 检查连续亏损
+    if risk_state['consecutive_losses'] >= risk_config['max_consecutive_losses']:
+        risk_state['circuit_breaker_active'] = True
+        return True, f"连续亏损{risk_state['consecutive_losses']}次，触发熔断"
+    
+    # 检查日亏损比例
+    try:
+        balance = exchange.fetch_balance()
+        total_balance = balance['USDT']['total']
+        
+        if total_balance > 0:
+            daily_loss_ratio = abs(risk_state['daily_pnl']) / total_balance
+            if risk_state['daily_pnl'] < 0 and daily_loss_ratio > risk_config['max_daily_loss_ratio']:
+                risk_state['circuit_breaker_active'] = True
+                return True, f"日亏损比例{daily_loss_ratio:.2%}，触发熔断"
+    
+    except Exception as e:
+        log_warning(f"熔断检查失败: {e}")
+    
+    return False, "熔断检查正常"
+
+
+def check_slippage_protection(expected_price, actual_price):
+    """检查滑点保护"""
+    risk_config = TRADE_CONFIG['risk_management']
+    if not risk_config.get('slippage_protection', True):
+        return True, "滑点保护已禁用"
+    
+    slippage = abs(actual_price - expected_price) / expected_price
+    if slippage > risk_config['max_slippage_ratio']:
+        return False, f"滑点过大: {slippage:.2%}"
+    
+    return True, f"滑点正常: {slippage:.2%}"
+
+
+def update_risk_state(trade_result):
+    """更新风险状态"""
+    global risk_state
+    
+    if trade_result.get('pnl'):
+        pnl = float(trade_result['pnl'])
+        risk_state['daily_pnl'] += pnl
+        
+        if pnl < 0:
+            risk_state['consecutive_losses'] += 1
+        else:
+            risk_state['consecutive_losses'] = 0  # 重置连续亏损
+
+
+def is_trading_allowed():
+    """检查是否允许交易"""
+    global risk_state
+    
+    if risk_state['emergency_stop']:
+        return False, "紧急停止状态"
+    
+    if risk_state['circuit_breaker_active']:
+        return False, "熔断状态"
+    
+    if risk_state['trading_suspended']:
+        return False, "交易暂停"
+    
+    return True, "允许交易"
+
+
+def reset_circuit_breaker():
+    """重置熔断状态（手动调用）"""
+    global risk_state
+    
+    risk_state['circuit_breaker_active'] = False
+    risk_state['consecutive_losses'] = 0
+    risk_state['emergency_stop'] = False
+    risk_state['trading_suspended'] = False
+    
+    log_info("🔄 风险控制状态已重置")
+
+
+def safe_create_market_order(symbol, side, amount, expected_price, params=None):
+    """安全的市价单执行，包含滑点保护"""
+    try:
+        # 执行订单
+        order = exchange.create_market_order(symbol, side, amount, params=params)
+        
+        # 获取实际成交价格
+        if order and 'average' in order and order['average']:
+            actual_price = float(order['average'])
+            
+            # 滑点检查
+            slippage_ok, slippage_msg = check_slippage_protection(expected_price, actual_price)
+            if not slippage_ok:
+                log_warning(f"⚠️ {slippage_msg}")
+                # 注意：订单已经执行，这里只是记录警告
+            else:
+                log_info(f"✅ {slippage_msg}")
+        
+        return order
+        
+    except Exception as e:
+        log_error(f"订单执行失败: {e}")
+        return None
+
 
 def calculate_intelligent_position(signal_data, price_data, current_position):
     """计算智能仓位大小 - 修复版"""
@@ -382,7 +672,7 @@ def calculate_intelligent_position(signal_data, price_data, current_position):
     # 🆕 新增：如果禁用智能仓位，使用固定仓位
     if not config.get('enable_intelligent_position', True):
         fixed_contracts = 0.1  # 固定仓位大小，可以根据需要调整
-        print(f"🔧 智能仓位已禁用，使用固定仓位: {fixed_contracts} 张")
+        log_info(f"🔧 智能仓位已禁用，使用固定仓位: {fixed_contracts} 张")
         return fixed_contracts
 
     try:
@@ -392,7 +682,7 @@ def calculate_intelligent_position(signal_data, price_data, current_position):
 
         # 基础USDT投入
         base_usdt = config['base_usdt_amount']
-        print(f"💰 可用USDT余额: {usdt_balance:.2f}, 下单基数{base_usdt}")
+        log_info(f"💰 可用USDT余额: {usdt_balance:.2f}, 下单基数{base_usdt}")
 
         # 根据信心程度调整 - 修复这里
         confidence_multiplier = {
@@ -427,17 +717,17 @@ def calculate_intelligent_position(signal_data, price_data, current_position):
         # 因为投入USDT是保证金，需要乘以杠杆得到名义价值，再除以单张合约价值
         contract_size = (final_usdt * TRADE_CONFIG['leverage']) / (price_data['price'] * TRADE_CONFIG['contract_size'])
 
-        print(f"📊 仓位计算详情:")
-        print(f"   - 基础USDT: {base_usdt}")
-        print(f"   - 信心倍数: {confidence_multiplier}")
-        print(f"   - 趋势倍数: {trend_multiplier}")
-        print(f"   - RSI倍数: {rsi_multiplier}")
-        print(f"   - 建议USDT: {suggested_usdt:.2f}")
-        print(f"   - 最终USDT(保证金): {final_usdt:.2f}")
-        print(f"   - 杠杆倍数: {TRADE_CONFIG['leverage']}x")
-        print(f"   - 名义价值: {final_usdt * TRADE_CONFIG['leverage']:.2f} USDT")
-        print(f"   - 合约乘数: {TRADE_CONFIG['contract_size']}")
-        print(f"   - 计算合约: {contract_size:.4f} 张")
+        log_info(f"📊 仓位计算详情:")
+        log_info(f"   - 基础USDT: {base_usdt}")
+        log_info(f"   - 信心倍数: {confidence_multiplier}")
+        log_info(f"   - 趋势倍数: {trend_multiplier}")
+        log_info(f"   - RSI倍数: {rsi_multiplier}")
+        log_info(f"   - 建议USDT: {suggested_usdt:.2f}")
+        log_info(f"   - 最终USDT(保证金): {final_usdt:.2f}")
+        log_info(f"   - 杠杆倍数: {TRADE_CONFIG['leverage']}x")
+        log_info(f"   - 名义价值: {final_usdt * TRADE_CONFIG['leverage']:.2f} USDT")
+        log_info(f"   - 合约乘数: {TRADE_CONFIG['contract_size']}")
+        log_info(f"   - 计算合约: {contract_size:.4f} 张")
         
         # 播报仓位计算详情
         broadcast_console_info("position_calculation",
@@ -455,13 +745,13 @@ def calculate_intelligent_position(signal_data, price_data, current_position):
         min_contracts = TRADE_CONFIG.get('min_amount', 0.01)
         if contract_size < min_contracts:
             contract_size = min_contracts
-            print(f"⚠️ 仓位小于最小值，调整为: {contract_size} 张")
+            log_warning(f"⚠️ 仓位小于最小值，调整为: {contract_size} 张")
 
-        print(f"🎯 最终仓位: {final_usdt:.2f} USDT → {contract_size:.2f} 张合约")
+        log_info(f"🎯 最终仓位: {final_usdt:.2f} USDT → {contract_size:.2f} 张合约")
         return contract_size
 
     except Exception as e:
-        print(f"❌ 仓位计算失败，使用基础仓位: {e}")
+        log_error(f"❌ 仓位计算失败，使用基础仓位: {e}")
         # 紧急备用计算
         base_usdt = config['base_usdt_amount']
         contract_size = (base_usdt * TRADE_CONFIG['leverage']) / (
@@ -511,7 +801,7 @@ def calculate_technical_indicators(df):
 
         return df
     except Exception as e:
-        print(f"技术指标计算失败: {e}")
+        log_error(f"技术指标计算失败: {e}")
         return df
 
 
@@ -538,7 +828,7 @@ def get_support_resistance_levels(df, lookback=20):
             'price_vs_support': ((current_price - support_level) / support_level) * 100
         }
     except Exception as e:
-        print(f"支撑阻力计算失败: {e}")
+        log_error(f"支撑阻力计算失败: {e}")
         return {}
 
 
@@ -598,7 +888,7 @@ def get_sentiment_indicators():
                         data_delay = int((datetime.now() - datetime.strptime(
                             period['startTime'], '%Y-%m-%d %H:%M:%S')).total_seconds() // 60)
 
-                        print(f"✅ 使用情绪数据时间: {period['startTime']} (延迟: {data_delay}分钟)")
+                        log_info(f"✅ 使用情绪数据时间: {period['startTime']} (延迟: {data_delay}分钟)")
 
                         return {
                             'positive_ratio': positive,
@@ -608,12 +898,12 @@ def get_sentiment_indicators():
                             'data_delay_minutes': data_delay
                         }
 
-                print("❌ 所有时间段数据都为空")
+                log_warning("❌ 所有时间段数据都为空")
                 return None
 
         return None
     except Exception as e:
-        print(f"情绪指标获取失败: {e}")
+        log_error(f"情绪指标获取失败: {e}")
         return None
 
 
@@ -645,7 +935,7 @@ def get_market_trend(df):
             'rsi_level': df['rsi'].iloc[-1]
         }
     except Exception as e:
-        print(f"趋势分析失败: {e}")
+        log_error(f"趋势分析失败: {e}")
         return {}
 
 
@@ -696,7 +986,7 @@ def get_btc_ohlcv_enhanced():
             'full_data': df
         }
     except Exception as e:
-        print(f"获取增强K线数据失败: {e}")
+        log_error(f"获取增强K线数据失败: {e}")
         return None
 
 
@@ -762,7 +1052,7 @@ def get_current_position():
         return None
 
     except Exception as e:
-        print(f"获取持仓失败: {e}")
+        log_error(f"获取持仓失败: {e}")
         import traceback
         traceback.print_exc()
         return None
@@ -931,7 +1221,7 @@ def analyze_with_bailian(price_data):
 
         # 安全解析JSON
         result = response.choices[0].message.content
-        print(f"Bailian原始回复: {result}")
+        log_info(f"Bailian原始回复: {result}")
 
         # 提取JSON部分
         start_idx = result.find('{')
@@ -960,24 +1250,53 @@ def analyze_with_bailian(price_data):
         # 信号统计
         signal_count = len([s for s in signal_history if s.get('signal') == signal_data['signal']])
         total_signals = len(signal_history)
-        print(f"信号统计: {signal_data['signal']} (最近{total_signals}次中出现{signal_count}次)")
+        log_info(f"信号统计: {signal_data['signal']} (最近{total_signals}次中出现{signal_count}次)")
 
         # 信号连续性检查
         if len(signal_history) >= 3:
             last_three = [s['signal'] for s in signal_history[-3:]]
             if len(set(last_three)) == 1:
-                print(f"⚠️ 注意：连续3次{signal_data['signal']}信号")
+                log_warning(f"⚠️ 注意：连续3次{signal_data['signal']}信号")
 
         return signal_data
 
     except Exception as e:
-        print(f"DeepSeek分析失败: {e}")
+        log_error(f"DeepSeek分析失败: {e}")
         return create_fallback_signal(price_data)
 
 
 def execute_intelligent_trade(signal_data, price_data):
     """执行智能交易 - OKX版本（支持同方向加仓减仓）"""
-    global position
+    global position, risk_state
+
+    # 🛡️ 风险控制检查
+    # 1. 检查是否允许交易
+    trading_allowed, reason = is_trading_allowed()
+    if not trading_allowed:
+        log_warning(f"🚫 交易被阻止: {reason}")
+        return
+
+    # 2. 价格异常检测
+    anomaly_detected, anomaly_reason = detect_price_anomaly(price_data['price'], price_history)
+    if anomaly_detected:
+        log_warning(f"🚨 检测到价格异常: {anomaly_reason}")
+        risk_state['trading_suspended'] = True
+        return
+
+    # 3. 波动率保护检查
+    high_volatility, volatility_reason = check_volatility_protection(price_history)
+    if high_volatility:
+        log_warning(f"⚡ 波动率保护触发: {volatility_reason}")
+        risk_state['trading_suspended'] = True
+        return
+
+    # 4. 熔断机制检查
+    circuit_breaker_triggered, breaker_reason = check_circuit_breaker()
+    if circuit_breaker_triggered:
+        log_error(f"🔴 熔断机制触发: {breaker_reason}")
+        return
+
+    log_info("✅ 风险控制检查通过，允许交易")
 
     current_position = get_current_position()
 
@@ -1007,11 +1326,7 @@ def execute_intelligent_trade(signal_data, price_data):
     # 计算智能仓位
     position_size = calculate_intelligent_position(signal_data, price_data, current_position)
 
-    print(f"交易信号: {signal_data['signal']}")
-    print(f"信心程度: {signal_data['confidence']}")
-    print(f"智能仓位: {position_size:.2f} 张")
-    print(f"理由: {signal_data['reason']}")
-    print(f"当前持仓: {current_position}")
+    log_trading(f"<b>交易信号生成</b>\n📊 信号: {signal_data['signal']}\n🎯 信心程度: {signal_data['confidence']}\n💰 智能仓位: {position_size:.2f} 张\n💡 理由: {signal_data['reason']}\n📦 当前持仓: {current_position}")
     
     # 🆕 发送Telegram交易信号通知
     if TELEGRAM_ENABLED:
@@ -1026,19 +1341,16 @@ def execute_intelligent_trade(signal_data, price_data):
         # 计算所需保证金
         required_margin = (position_size * TRADE_CONFIG['contract_size'] * price_data['price']) / TRADE_CONFIG['leverage']
         
-        print(f"💳 保证金检查:")
-        print(f"   - 可用余额: {usdt_balance:.2f} USDT")
-        print(f"   - 所需保证金: {required_margin:.2f} USDT")
-        print(f"   - 安全余量: {usdt_balance - required_margin:.2f} USDT")
+        log_info(f"<b>💳 保证金检查</b>\n💰 可用余额: {usdt_balance:.2f} USDT\n💵 所需保证金: {required_margin:.2f} USDT\n📊 安全余量: {usdt_balance - required_margin:.2f} USDT")
         
         # 播报保证金检查信息
         if required_margin > usdt_balance * 0.95:  # 保留5%安全余量
-            print(f"❌ 保证金不足！调整仓位大小...")
+            log_warning("保证金不足！正在调整仓位大小...")
             # 重新计算安全仓位
             safe_margin = usdt_balance * 0.9  # 使用90%的余额
             position_size = (safe_margin * TRADE_CONFIG['leverage']) / (price_data['price'] * TRADE_CONFIG['contract_size'])
             position_size = round(position_size, 2)
-            print(f"🔧 调整后仓位: {position_size:.2f} 张")
+            log_info(f"🔧 调整后仓位: {position_size:.2f} 张")
             
             broadcast_console_info("margin_check",
                                   available_balance=usdt_balance,
@@ -1052,21 +1364,21 @@ def execute_intelligent_trade(signal_data, price_data):
                                   check_result="保证金充足")
             
             if position_size < TRADE_CONFIG.get('min_amount', 0.01):
-                print(f"⚠️ 调整后仓位仍小于最小值，跳过交易")
+                log_warning("调整后仓位仍小于最小值，跳过交易")
                 return
                 
     except Exception as e:
-        print(f"⚠️ 保证金检查失败: {e}")
+        log_warning(f"保证金检查失败: {e}")
         # 继续执行，但使用更保守的仓位
         position_size = min(position_size, 0.01)
 
     # 风险管理
     if signal_data['confidence'] == 'LOW' and not TRADE_CONFIG['test_mode']:
-        print("⚠️ 低信心信号，跳过执行")
+        log_warning("低信心信号，跳过执行")
         return
 
     if TRADE_CONFIG['test_mode']:
-        print("测试模式 - 仅模拟交易")
+        log_info("测试模式 - 仅模拟交易")
         return
 
     try:
@@ -1075,7 +1387,7 @@ def execute_intelligent_trade(signal_data, price_data):
             if current_position and current_position['side'] == 'short':
                 # 先检查空头持仓是否真实存在且数量正确
                 if current_position['size'] > 0:
-                    print(f"平空仓 {current_position['size']:.2f} 张并开多仓 {position_size:.2f} 张...")
+                    log_trading(f"🔄 平空仓 {current_position['size']:.2f} 张并开多仓 {position_size:.2f} 张...")
                     # 平空仓
                     exchange.create_market_order(
                         TRADE_CONFIG['symbol'],
@@ -1092,7 +1404,7 @@ def execute_intelligent_trade(signal_data, price_data):
                         params={'tag': '60bb4a8d3416BCDE'}
                     )
                 else:
-                    print("⚠️ 检测到空头持仓但数量为0，直接开多仓")
+                    log_warning("检测到空头持仓但数量为0，直接开多仓")
                     exchange.create_market_order(
                         TRADE_CONFIG['symbol'],
                         'buy',
@@ -1108,8 +1420,7 @@ def execute_intelligent_trade(signal_data, price_data):
                     if size_diff > 0:
                         # 加仓
                         add_size = round(size_diff, 2)
-                        print(
-                            f"多仓加仓 {add_size:.2f} 张 (当前:{current_position['size']:.2f} → 目标:{position_size:.2f})")
+                        log_trading(f"📈 多仓加仓 {add_size:.2f} 张 (当前:{current_position['size']:.2f} → 目标:{position_size:.2f})")
                         exchange.create_market_order(
                             TRADE_CONFIG['symbol'],
                             'buy',
@@ -1119,8 +1430,7 @@ def execute_intelligent_trade(signal_data, price_data):
                     else:
                         # 减仓
                         reduce_size = round(abs(size_diff), 2)
-                        print(
-                            f"多仓减仓 {reduce_size:.2f} 张 (当前:{current_position['size']:.2f} → 目标:{position_size:.2f})")
+                        log_trading(f"📉 多仓减仓 {reduce_size:.2f} 张 (当前:{current_position['size']:.2f} → 目标:{position_size:.2f})")
                         exchange.create_market_order(
                             TRADE_CONFIG['symbol'],
                             'sell',
@@ -1128,11 +1438,10 @@ def execute_intelligent_trade(signal_data, price_data):
                             params={'reduceOnly': True, 'tag': '60bb4a8d3416BCDE'}
                         )
                 else:
-                    print(
-                        f"已有多头持仓，仓位合适保持现状 (当前:{current_position['size']:.2f}, 目标:{position_size:.2f})")
+                    log_info(f"已有多头持仓，仓位合适保持现状 (当前:{current_position['size']:.2f}, 目标:{position_size:.2f})")
             else:
                 # 无持仓时开多仓
-                print(f"开多仓 {position_size:.2f} 张...")
+                log_trading(f"🟢 开多仓 {position_size:.2f} 张...")
                 exchange.create_market_order(
                     TRADE_CONFIG['symbol'],
                     'buy',
@@ -1144,7 +1453,7 @@ def execute_intelligent_trade(signal_data, price_data):
             if current_position and current_position['side'] == 'long':
                 # 先检查多头持仓是否真实存在且数量正确
                 if current_position['size'] > 0:
-                    print(f"平多仓 {current_position['size']:.2f} 张并开空仓 {position_size:.2f} 张...")
+                    log_trading(f"🔄 平多仓 {current_position['size']:.2f} 张并开空仓 {position_size:.2f} 张...")
                     # 平多仓
                     exchange.create_market_order(
                         TRADE_CONFIG['symbol'],
@@ -1161,7 +1470,7 @@ def execute_intelligent_trade(signal_data, price_data):
                         params={'tag': '60bb4a8d3416BCDE'}
                     )
                 else:
-                    print("⚠️ 检测到多头持仓但数量为0，直接开空仓")
+                    log_warning("检测到多头持仓但数量为0，直接开空仓")
                     exchange.create_market_order(
                         TRADE_CONFIG['symbol'],
                         'sell',
@@ -1177,8 +1486,7 @@ def execute_intelligent_trade(signal_data, price_data):
                     if size_diff > 0:
                         # 加仓
                         add_size = round(size_diff, 2)
-                        print(
-                            f"空仓加仓 {add_size:.2f} 张 (当前:{current_position['size']:.2f} → 目标:{position_size:.2f})")
+                        log_trading(f"📈 空仓加仓 {add_size:.2f} 张 (当前:{current_position['size']:.2f} → 目标:{position_size:.2f})")
                         exchange.create_market_order(
                             TRADE_CONFIG['symbol'],
                             'sell',
@@ -1188,8 +1496,7 @@ def execute_intelligent_trade(signal_data, price_data):
                     else:
                         # 减仓
                         reduce_size = round(abs(size_diff), 2)
-                        print(
-                            f"空仓减仓 {reduce_size:.2f} 张 (当前:{current_position['size']:.2f} → 目标:{position_size:.2f})")
+                        log_trading(f"📉 空仓减仓 {reduce_size:.2f} 张 (当前:{current_position['size']:.2f} → 目标:{position_size:.2f})")
                         exchange.create_market_order(
                             TRADE_CONFIG['symbol'],
                             'buy',
@@ -1197,11 +1504,10 @@ def execute_intelligent_trade(signal_data, price_data):
                             params={'reduceOnly': True, 'tag': '60bb4a8d3416BCDE'}
                         )
                 else:
-                    print(
-                        f"已有空头持仓，仓位合适保持现状 (当前:{current_position['size']:.2f}, 目标:{position_size:.2f})")
+                    log_info(f"已有空头持仓，仓位合适保持现状 (当前:{current_position['size']:.2f}, 目标:{position_size:.2f})")
             else:
                 # 无持仓时开空仓
-                print(f"开空仓 {position_size:.2f} 张...")
+                log_trading(f"🔴 开空仓 {position_size:.2f} 张...")
                 exchange.create_market_order(
                     TRADE_CONFIG['symbol'],
                     'sell',
@@ -1210,13 +1516,13 @@ def execute_intelligent_trade(signal_data, price_data):
                 )
 
         elif signal_data['signal'] == 'HOLD':
-            print("建议观望，不执行交易")
+            log_info("建议观望，不执行交易")
             return
 
-        print("智能交易执行成功")
+        log_success("智能交易执行成功")
         time.sleep(2)
         position = get_current_position()
-        print(f"更新后持仓: {position}")
+        log_info(f"更新后持仓: {position}")
         
         # 🆕 发送交易成功通知和余额更新
         if TELEGRAM_ENABLED:
@@ -1290,11 +1596,11 @@ def analyze_with_bailian_with_retry(price_data, max_retries=2):
             if signal_data and not signal_data.get('is_fallback', False):
                 return signal_data
 
-            print(f"第{attempt + 1}次尝试失败，进行重试...")
+            log_warning(f"第{attempt + 1}次尝试失败，进行重试...")
             time.sleep(1)
 
         except Exception as e:
-            print(f"第{attempt + 1}次尝试异常: {e}")
+            log_error(f"第{attempt + 1}次尝试异常: {e}")
             if attempt == max_retries - 1:
                 return create_fallback_signal(price_data)
             time.sleep(1)
@@ -1340,18 +1646,41 @@ def trading_bot():
         time.sleep(wait_seconds)
 
     """主交易机器人函数"""
-    print("\n" + "=" * 60)
-    print(f"执行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 60)
+    global price_history, risk_state
+    
+    log_info("\n" + "=" * 60)
+    log_info(f"执行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    log_info("=" * 60)
 
     # 1. 获取增强版K线数据
     price_data = get_btc_ohlcv_enhanced()
     if not price_data:
         return
 
-    print(f"BTC当前价格: ${price_data['price']:,.2f}")
-    print(f"数据周期: {TRADE_CONFIG['timeframe']}")
-    print(f"价格变化: {price_data['price_change']:+.2f}%")
+    # 🛡️ 更新价格历史（用于风险控制）
+    price_history.append({
+        'price': price_data['price'],
+        'timestamp': time.time(),
+        'datetime': datetime.now()
+    })
+    
+    # 保持价格历史长度（保留最近100个数据点）
+    if len(price_history) > 100:
+        price_history = price_history[-100:]
+
+    # 🛡️ 每日重置风险状态（在新的一天开始时）
+    current_date = datetime.now().date()
+    if not hasattr(risk_state, 'last_reset_date') or risk_state.get('last_reset_date') != current_date:
+        risk_state['daily_pnl'] = 0.0
+        risk_state['last_reset_date'] = current_date
+        log_info("🔄 每日风险状态已重置")
+
+    log_info(f"BTC当前价格: ${price_data['price']:,.2f}")
+    log_info(f"数据周期: {TRADE_CONFIG['timeframe']}")
+    log_info(f"价格变化: {price_data['price_change']:+.2f}%")
+    
+    # 🛡️ 显示风险状态
+    log_info(f"🛡️ 风险状态: 连续亏损{risk_state['consecutive_losses']}次, 日盈亏{risk_state['daily_pnl']:+.2f}USDT")
     
     # 播报交易分析开始信息
     broadcast_console_info("trading_start", 
@@ -1364,7 +1693,7 @@ def trading_bot():
     signal_data = analyze_with_bailian_with_retry(price_data)
 
     if signal_data.get('is_fallback', False):
-        print("⚠️ 使用备用交易信号")
+        log_warning("⚠️ 使用备用交易信号")
     
     # 播报信号生成信息
     broadcast_console_info("signal_generated",
@@ -1379,16 +1708,29 @@ def trading_bot():
 
 def main():
     """主函数"""
-    print("BTC/USDT OKX自动交易机器人启动成功！")
-    print("融合技术指标策略 + OKX实盘接口")
+    log_success("BTC/USDT OKX自动交易机器人启动成功！")
+    log_info("融合技术指标策略 + OKX实盘接口")
 
     if TRADE_CONFIG['test_mode']:
-        print("当前为模拟模式，不会真实下单")
+        log_warning("当前为模拟模式，不会真实下单")
     else:
-        print("实盘交易模式，请谨慎操作！")
+        log_warning("实盘交易模式，请谨慎操作！")
 
-    print(f"交易周期: {TRADE_CONFIG['timeframe']}")
-    print("已启用完整技术指标分析和持仓跟踪功能")
+    log_info(f"交易周期: {TRADE_CONFIG['timeframe']}")
+    log_info("已启用完整技术指标分析和持仓跟踪功能")
+    
+    # 🛡️ 显示风险控制配置
+    risk_config = TRADE_CONFIG['risk_management']
+    log_info("🛡️ 风险控制配置:")
+    log_info(f"   - 价格异常检测: {'启用' if risk_config['enable_anomaly_detection'] else '禁用'}")
+    log_info(f"   - 最大1分钟变化: {risk_config['max_price_change_1m']:.1%}")
+    log_info(f"   - 最大5分钟变化: {risk_config['max_price_change_5m']:.1%}")
+    log_info(f"   - 波动率阈值: {risk_config['max_volatility_threshold']:.1%}")
+    log_info(f"   - 熔断机制: {'启用' if risk_config['circuit_breaker_enabled'] else '禁用'}")
+    log_info(f"   - 最大连续亏损: {risk_config['max_consecutive_losses']}次")
+    log_info(f"   - 最大日亏损比例: {risk_config['max_daily_loss_ratio']:.1%}")
+    log_info(f"   - 滑点保护: {'启用' if risk_config['slippage_protection'] else '禁用'}")
+    log_info(f"   - 最大滑点: {risk_config['max_slippage_ratio']:.1%}")
     
     # 🆕 发送启动通知
     if TELEGRAM_ENABLED:
@@ -1411,18 +1753,18 @@ def main():
 
     # 设置交易所
     if not setup_exchange():
-        print("交易所初始化失败，程序退出")
+        log_error("交易所初始化失败，程序退出")
         return
 
     # 测试大模型API
     if not test_bailian_api():
-        print("⚠️ 大模型API不可用，程序将使用备用交易信号")
-        print("💡 建议修复API配置后重新启动以获得最佳交易效果")
+        log_warning("⚠️ 大模型API不可用，程序将使用备用交易信号")
+        log_info("💡 建议修复API配置后重新启动以获得最佳交易效果")
         input("按回车键继续运行（将使用技术指标备用信号）...")
 
-    print("执行频率: 每15分钟整点执行")
+    log_info("执行频率: 每15分钟整点执行")
     if TELEGRAM_ENABLED:
-        print("已启用Telegram播报：交易信号、余额更新、错误通知")
+        log_info("已启用Telegram播报：交易信号、余额更新、错误通知")
 
     # 🆕 定期余额播报计时器
     last_balance_report = datetime.now()
@@ -1457,12 +1799,12 @@ def main():
                         send_telegram_message(report_message)
                         last_balance_report = datetime.now()
                 except Exception as e:
-                    print(f"⚠️ 余额报告发送失败: {e}")
+                    log_error(f"⚠️ 余额报告发送失败: {e}")
 
             # 执行完后等待一段时间再检查（避免频繁循环）
             time.sleep(60)  # 每分钟检查一次
     except KeyboardInterrupt:
-        print("\n程序已停止")
+        log_info("\n程序已停止")
         
         # 🆕 发送停止通知
         if TELEGRAM_ENABLED:
