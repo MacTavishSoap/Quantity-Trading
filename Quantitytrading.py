@@ -12,6 +12,9 @@ from datetime import datetime, timedelta
 
 load_dotenv()
 
+# 模型配置
+MODEL_NAME = os.getenv('AI_MODEL_NAME', 'qwen3-max')  # 默认使用qwen3-max
+
 # 初始化阿里云百炼客户端
 bailian_client = OpenAI(
     api_key=os.getenv('DASHSCOPE_API_KEY'),
@@ -172,6 +175,36 @@ def setup_exchange():
         print(f"❌ 交易所设置失败: {e}")
         import traceback
         traceback.print_exc()
+        return False
+
+
+def test_bailian_api():
+    """测试阿里云百炼API是否可用"""
+    try:
+        print("🔍 检测大模型接口可用性...")
+        
+        # 发送一个简单的测试请求
+        test_response = bailian_client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": "你是一个测试助手。"},
+                {"role": "user", "content": "请回复'API测试成功'"}
+            ],
+            stream=False,
+            temperature=0.1,
+            max_tokens=50
+        )
+        
+        response_content = test_response.choices[0].message.content
+        print(f"✅ 大模型API测试成功: {response_content}")
+        return True
+        
+    except Exception as e:
+        print(f"❌ 大模型API测试失败: {e}")
+        print("💡 请检查:")
+        print("   1. DASHSCOPE_API_KEY是否正确配置")
+        print("   2. 网络连接是否正常")
+        print("   3. API密钥是否有效且有足够余额")
         return False
 
 
@@ -713,7 +746,7 @@ def analyze_with_bailian(price_data):
 
     try:
         response = bailian_client.chat.completions.create(
-            model="qwen3-max",
+            model=MODEL_NAME,
             messages=[
                 {"role": "system",
                  "content": f"您是一位急需资金来治疗母亲疾病的专业交易员，你需要从加密货币市场获得足够的资金用于治疗你的母亲，专注于{TRADE_CONFIG['timeframe']}周期趋势分析。请结合K线形态和技术指标做出判断，并严格遵循JSON格式要求。"},
@@ -1092,6 +1125,12 @@ def main():
     if not setup_exchange():
         print("交易所初始化失败，程序退出")
         return
+
+    # 测试大模型API
+    if not test_bailian_api():
+        print("⚠️ 大模型API不可用，程序将使用备用交易信号")
+        print("💡 建议修复API配置后重新启动以获得最佳交易效果")
+        input("按回车键继续运行（将使用技术指标备用信号）...")
 
     print("执行频率: 每15分钟整点执行")
 
