@@ -6,9 +6,21 @@
 
 import requests
 import json
+import os
+from dotenv import load_dotenv
 
-# 您的Bot Token
-BOT_TOKEN = "8593405195:AAHjfJ9MsHH2NKKKMAE3UcX0Wj5Zjblbfso"
+# 加载环境变量
+load_dotenv()
+
+# 从环境变量或.env文件读取Bot Token
+BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN') or os.getenv('TELEGRAM_BOT_TOKEN')
+
+if not BOT_TOKEN:
+    print("❌ 错误: 未找到Telegram Bot Token!")
+    print("请确保在以下位置之一设置了TELEGRAM_BOT_TOKEN:")
+    print("1. 系统环境变量")
+    print("2. .env文件")
+    exit(1)
 
 def get_chat_id():
     """获取Chat ID"""
