@@ -54,7 +54,7 @@ exchange = ccxt.okx({
 # 交易参数配置 - 结合两个版本的优点
 TRADE_CONFIG = {
     'symbol': 'BTC/USDT:USDT',  # OKX的合约符号格式
-    'leverage': 10,  # 杠杆倍数,只影响保证金不影响下单价值
+    'leverage': 20,  # 🔧 提高杠杆倍数，增加盈利潜力（原10→20）
     'timeframe': '15m',  # 使用15分钟K线
     'test_mode': False,  # 测试模式
     'data_points': 96,  # 24小时数据（96根15分钟K线）
@@ -66,12 +66,14 @@ TRADE_CONFIG = {
     # 新增智能仓位参数
     'position_management': {
         'enable_intelligent_position': True,  # 🆕 新增：是否启用智能仓位管理
-        'base_usdt_amount': 10,  # USDT投入下单基数
-        'high_confidence_multiplier': 1.5,
-        'medium_confidence_multiplier': 1.0,
-        'low_confidence_multiplier': 0.5,
-        'max_position_ratio': 0.8,  # 单次最大仓位比例（80%的余额）
-        'trend_strength_multiplier': 1.2
+        'base_usdt_amount': 30,  # 🔧 增加基础仓位（原10→30 USDT）
+        'high_confidence_multiplier': 2.0,  # 🔧 提高高信心倍数（原1.5→2.0）
+        'medium_confidence_multiplier': 1.2,  # 🔧 提高中等信心倍数（原1.0→1.2）
+        'low_confidence_multiplier': 0.6,  # 🔧 提高低信心倍数（原0.5→0.6）
+        'max_position_ratio': 0.8,  # 🔧 降低最大仓位比例，控制风险（原0.8→0.6）
+        'trend_strength_multiplier': 1.5,  # 🔧 提高趋势强度倍数（原1.2→1.5）
+        'min_profit_ratio': 0.003,  # 🆕 最小盈利比例（0.3%），确保覆盖手续费
+        'fee_rate': 0.0005  # 🆕 手续费率（0.05%），用于盈亏计算
     },
     # 🛡️ 风险控制参数 - 防黑天鹅和插针
     'risk_management': {
@@ -87,7 +89,11 @@ TRADE_CONFIG = {
         'emergency_stop_enabled': True,  # 启用紧急停止
         'price_deviation_threshold': 0.03,  # 价格偏差阈值（3%）
         'volatility_window': 20,  # 波动率计算窗口（分钟）
-        'anomaly_cooldown': 300  # 异常检测后的冷却时间（秒）
+        'anomaly_cooldown': 300,  # 异常检测后的冷却时间（秒）
+        # 🆕 交易频率控制
+        'min_trade_interval': 900,  # 最小交易间隔（15分钟 = 900秒）
+        'max_trades_per_hour': 3,  # 每小时最大交易次数
+        'max_trades_per_day': 20  # 每日最大交易次数
     }
 }
 
@@ -455,7 +461,13 @@ risk_state = {
     'emergency_stop': False,  # 紧急停止状态
     'trading_suspended': False,  # 交易暂停状态
     'last_price_check': None,  # 上次价格检查
-    'volatility_history': []  # 波动率历史
+    'volatility_history': [],  # 波动率历史
+    # 🆕 交易频率控制
+    'last_trade_time': 0,  # 上次交易时间
+    'trades_today': 0,  # 今日交易次数
+    'trades_this_hour': 0,  # 本小时交易次数
+    'last_hour_reset': 0,  # 上次小时重置时间
+    'last_day_reset': 0  # 上次日期重置时间
 }
 
 
@@ -628,6 +640,58 @@ def is_trading_allowed():
     return True, "允许交易"
 
 
+def check_trading_frequency():
+    """检查交易频率限制"""
+    global risk_state
+    
+    try:
+        risk_config = TRADE_CONFIG['risk_management']
+        current_time = time.time()
+        
+        # 重置小时计数器
+        if current_time - risk_state['last_hour_reset'] >= 3600:  # 1小时
+            risk_state['trades_this_hour'] = 0
+            risk_state['last_hour_reset'] = current_time
+        
+        # 重置日计数器
+        if current_time - risk_state['last_day_reset'] >= 86400:  # 24小时
+            risk_state['trades_today'] = 0
+            risk_state['last_day_reset'] = current_time
+        
+        # 检查最小交易间隔
+        if risk_state['last_trade_time'] > 0:
+            time_since_last = current_time - risk_state['last_trade_time']
+            if time_since_last < risk_config['min_trade_interval']:
+                remaining = risk_config['min_trade_interval'] - time_since_last
+                return False, f"交易间隔不足，还需等待 {remaining:.0f} 秒"
+        
+        # 检查小时交易次数
+        if risk_state['trades_this_hour'] >= risk_config['max_trades_per_hour']:
+            return False, f"本小时交易次数已达上限 ({risk_config['max_trades_per_hour']}次)"
+        
+        # 检查日交易次数
+        if risk_state['trades_today'] >= risk_config['max_trades_per_day']:
+            return False, f"今日交易次数已达上限 ({risk_config['max_trades_per_day']}次)"
+        
+        return True, "交易频率检查通过"
+        
+    except Exception as e:
+        log_error(f"交易频率检查失败: {e}")
+        return True, "检查失败，允许交易"
+
+
+def update_trading_frequency():
+    """更新交易频率统计"""
+    global risk_state
+    
+    current_time = time.time()
+    risk_state['last_trade_time'] = current_time
+    risk_state['trades_this_hour'] += 1
+    risk_state['trades_today'] += 1
+    
+    log_info(f"📊 交易频率统计: 本小时 {risk_state['trades_this_hour']} 次，今日 {risk_state['trades_today']} 次")
+
+
 def reset_circuit_breaker():
     """重置熔断状态（手动调用）"""
     global risk_state
@@ -638,6 +702,53 @@ def reset_circuit_breaker():
     risk_state['trading_suspended'] = False
     
     log_info("🔄 风险控制状态已重置")
+
+
+def check_profit_potential(signal_data, price_data, position_size):
+    """检查交易的盈利潜力是否足够覆盖手续费"""
+    try:
+        config = TRADE_CONFIG['position_management']
+        current_price = price_data['price']
+        
+        # 计算名义价值和手续费
+        nominal_value = position_size * current_price
+        total_fee = nominal_value * config['fee_rate'] * 2  # 开平仓手续费
+        
+        # 根据信号强度估算盈利潜力
+        confidence = signal_data.get('confidence', 'MEDIUM')
+        
+        # 预期盈利比例（基于历史经验）
+        expected_profit_ratios = {
+            'HIGH': 0.008,    # 高信心信号预期0.8%盈利
+            'MEDIUM': 0.005,  # 中等信心信号预期0.5%盈利
+            'LOW': 0.003      # 低信心信号预期0.3%盈利
+        }
+        
+        expected_profit_ratio = expected_profit_ratios.get(confidence, 0.005)
+        expected_profit = nominal_value * expected_profit_ratio
+        
+        # 计算盈亏比
+        profit_to_fee_ratio = expected_profit / total_fee if total_fee > 0 else 0
+        
+        log_info(f"📊 盈亏比分析:")
+        log_info(f"   - 仓位大小: {position_size:.4f}")
+        log_info(f"   - 名义价值: {nominal_value:.2f} USDT")
+        log_info(f"   - 预计手续费: {total_fee:.4f} USDT")
+        log_info(f"   - 预期盈利: {expected_profit:.4f} USDT ({expected_profit_ratio:.1%})")
+        log_info(f"   - 盈亏比: {profit_to_fee_ratio:.1f}:1")
+        
+        # 盈亏比至少要2:1才值得交易
+        min_ratio = 2.0
+        if profit_to_fee_ratio >= min_ratio:
+            log_info(f"✅ 盈亏比良好 ({profit_to_fee_ratio:.1f}:1 >= {min_ratio}:1)")
+            return True, f"盈亏比: {profit_to_fee_ratio:.1f}:1"
+        else:
+            log_warning(f"⚠️ 盈亏比不足 ({profit_to_fee_ratio:.1f}:1 < {min_ratio}:1)")
+            return False, f"盈亏比不足: {profit_to_fee_ratio:.1f}:1"
+            
+    except Exception as e:
+        log_error(f"盈亏比检查失败: {e}")
+        return True, "检查失败，允许交易"  # 出错时允许交易
 
 
 def safe_create_market_order(symbol, side, amount, expected_price, params=None):
@@ -746,6 +857,21 @@ def calculate_intelligent_position(signal_data, price_data, current_position):
         if contract_size < min_contracts:
             contract_size = min_contracts
             log_warning(f"⚠️ 仓位小于最小值，调整为: {contract_size} 张")
+
+        # 🆕 手续费计算和盈亏比检查
+        nominal_value = final_usdt * TRADE_CONFIG['leverage']  # 名义价值
+        total_fee = nominal_value * config['fee_rate'] * 2  # 开仓+平仓手续费
+        min_profit_needed = nominal_value * config['min_profit_ratio']  # 最小盈利需求
+        
+        log_info(f"💰 手续费分析:")
+        log_info(f"   - 名义价值: {nominal_value:.2f} USDT")
+        log_info(f"   - 预计手续费: {total_fee:.4f} USDT (开平仓)")
+        log_info(f"   - 最小盈利需求: {min_profit_needed:.4f} USDT")
+        log_info(f"   - 盈亏比要求: {config['min_profit_ratio']:.1%}")
+        
+        # 检查仓位是否足够覆盖手续费
+        if min_profit_needed < total_fee * 1.5:  # 盈利至少是手续费的1.5倍
+            log_warning(f"⚠️ 仓位可能过小，建议盈利至少 {total_fee * 1.5:.4f} USDT")
 
         log_info(f"🎯 最终仓位: {final_usdt:.2f} USDT → {contract_size:.2f} 张合约")
         return contract_size
@@ -1296,6 +1422,12 @@ def execute_intelligent_trade(signal_data, price_data):
         log_error(f"🔴 熔断机制触发: {breaker_reason}")
         return
 
+    # 5. 交易频率检查
+    frequency_allowed, frequency_reason = check_trading_frequency()
+    if not frequency_allowed:
+        log_warning(f"⏰ 交易频率限制: {frequency_reason}")
+        return
+
     log_info("✅ 风险控制检查通过，允许交易")
 
     current_position = get_current_position()
@@ -1325,6 +1457,12 @@ def execute_intelligent_trade(signal_data, price_data):
 
     # 计算智能仓位
     position_size = calculate_intelligent_position(signal_data, price_data, current_position)
+
+    # 🆕 盈亏比检查
+    profit_ok, profit_reason = check_profit_potential(signal_data, price_data, position_size)
+    if not profit_ok:
+        log_warning(f"💸 {profit_reason}，跳过此次交易")
+        return
 
     log_trading(f"<b>交易信号生成</b>\n📊 信号: {signal_data['signal']}\n🎯 信心程度: {signal_data['confidence']}\n💰 智能仓位: {position_size:.2f} 张\n💡 理由: {signal_data['reason']}\n📦 当前持仓: {current_position}")
     
@@ -1520,6 +1658,10 @@ def execute_intelligent_trade(signal_data, price_data):
             return
 
         log_success("智能交易执行成功")
+        
+        # 🆕 更新交易频率统计
+        update_trading_frequency()
+        
         time.sleep(2)
         position = get_current_position()
         log_info(f"更新后持仓: {position}")
