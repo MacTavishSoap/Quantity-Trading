@@ -9,30 +9,25 @@ from dotenv import load_dotenv
 import json
 import requests
 from datetime import datetime, timedelta
-import asyncio
-from telegram import Bot
-from telegram.error import TelegramError
+# 移除了异步相关导入，使用requests进行HTTP通信
 
 load_dotenv()
 
 # 模型配置
 MODEL_NAME = os.getenv('AI_MODEL_NAME', 'qwen3-max')  # 默认使用qwen3-max
 
-# Telegram配置 - Token从系统环境变量读取，更安全
+# Telegram配置 - 使用HTTP API，无需异步
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN') or os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 TELEGRAM_ENABLED = os.getenv('TELEGRAM_ENABLED', 'false').lower() == 'true'
 
-# 初始化Telegram Bot
-telegram_bot = None
-if TELEGRAM_ENABLED and TELEGRAM_BOT_TOKEN:
-    try:
-        telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
-        # 这里不使用dual_output，因为函数还未定义，使用普通print
-        print("✅ Telegram Bot 初始化成功")
-    except Exception as e:
-        # 这里不使用dual_output，因为函数还未定义，使用普通print
-        print(f"❌ Telegram Bot 初始化失败: {e}")
+# 验证Telegram配置
+if TELEGRAM_ENABLED:
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        print("✅ Telegram 配置已启用")
+    else:
+        print("❌ Telegram 配置不完整，将禁用通知功能")
+        TELEGRAM_ENABLED = False
         TELEGRAM_ENABLED = False
 
 # 初始化阿里云百炼客户端
@@ -70,7 +65,7 @@ TRADE_CONFIG = {
         'high_confidence_multiplier': 2.0,  # 🔧 提高高信心倍数（原1.5→2.0）
         'medium_confidence_multiplier': 1.2,  # 🔧 提高中等信心倍数（原1.0→1.2）
         'low_confidence_multiplier': 0.6,  # 🔧 提高低信心倍数（原0.5→0.6）
-        'max_position_ratio': 0.8,  # 🔧 降低最大仓位比例，控制风险（原0.8→0.6）
+        'max_position_ratio': 0.8,  # 
         'trend_strength_multiplier': 1.5,  # 🔧 提高趋势强度倍数（原1.2→1.5）
         'min_profit_ratio': 0.003,  # 🆕 最小盈利比例（0.3%），确保覆盖手续费
         'fee_rate': 0.0005  # 🆕 手续费率（0.05%），用于盈亏计算
@@ -252,27 +247,31 @@ def test_bailian_api():
 
 # Telegram消息发送功能
 def send_telegram_message(message, parse_mode='HTML'):
-    """发送Telegram消息"""
-    if not TELEGRAM_ENABLED or not telegram_bot or not TELEGRAM_CHAT_ID:
+    """发送Telegram消息 - 使用HTTP API避免异步问题"""
+    if not TELEGRAM_ENABLED or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return False
     
     try:
-        # 使用同步方式发送消息
-        import asyncio
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        # 使用Telegram Bot API的HTTP接口，完全避免异步问题
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         
-        async def send_async():
-            await telegram_bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=message,
-                parse_mode=parse_mode
-            )
+        data = {
+            'chat_id': TELEGRAM_CHAT_ID,
+            'text': message,
+            'parse_mode': parse_mode
+        }
         
-        loop.run_until_complete(send_async())
-        loop.close()
-        return True
+        response = requests.post(url, data=data, timeout=10)
         
+        if response.status_code == 200:
+            return True
+        else:
+            print(f"❌ Telegram API错误: {response.status_code} - {response.text}")
+            return False
+            
+    except requests.exceptions.Timeout:
+        print("❌ Telegram消息发送超时")
+        return False
     except Exception as e:
         print(f"❌ Telegram消息发送失败: {e}")
         return False
