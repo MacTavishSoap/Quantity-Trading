@@ -68,7 +68,9 @@ TRADE_CONFIG = {
         'max_position_ratio': 0.8,  # 
         'trend_strength_multiplier': 1.5,  # 🔧 提高趋势强度倍数（原1.2→1.5）
         'min_profit_ratio': 0.003,  # 🆕 最小盈利比例（0.3%），确保覆盖手续费
-        'fee_rate': 0.0005  # 🆕 手续费率（0.05%），用于盈亏计算
+        'fee_rate': 0.0005,  # 🆕 手续费率（0.05%），用于盈亏计算
+        # 新增：同方向微调的相对阈值，避免高频微调耗尽频次
+        'min_relative_adjust_ratio': 0.03  # 仅当|Δsize|/current_size≥此比例才同向调仓
     },
     # 🛡️ 风险控制参数 - 防黑天鹅和插针
     'risk_management': {
@@ -87,8 +89,14 @@ TRADE_CONFIG = {
         'anomaly_cooldown': 300,  # 异常检测后的冷却时间（秒）
         # 🆕 交易频率控制
         'min_trade_interval': 900,  # 最小交易间隔（15分钟 = 900秒）
-        'max_trades_per_hour': 3,  # 每小时最大交易次数
-        'max_trades_per_day': 20  # 每日最大交易次数
+        'max_trades_per_hour': 6,  # 每小时最大交易次数
+        'max_trades_per_day': 40,  # 每日最大交易次数
+        # 🔒 锁盈（可选）配置
+        'profit_lock_enabled': False,  # 是否启用锁盈机制（默认关闭）
+        'profit_lock_trigger_ratio': 0.02,  # 触发锁盈的收益比例（2%）
+        'profit_lock_step_ratio': 0.2,  # 每次锁盈的合约比例（例如20%）
+        'profit_lock_cooldown': 600,  # 锁盈冷却时间（秒）
+        'profit_lock_min_contracts': 0.01  # 每次最少锁盈的合约张数
     }
 }
 
@@ -277,6 +285,50 @@ def send_telegram_message(message, parse_mode='HTML'):
         return False
 
 
+# 🧩 Telegram批量消息收集与汇总
+# 默认启用批量模式，减少消息碎片化
+TELEGRAM_BATCH_MODE = True
+_telegram_sections = []
+
+def start_telegram_cycle():
+    """开始一个Telegram汇总周期（清空缓冲）"""
+    global _telegram_sections
+    _telegram_sections = []
+
+def add_telegram_section(title, body):
+    """添加一个消息板块到汇总缓冲"""
+    if not TELEGRAM_ENABLED:
+        return
+    _telegram_sections.append((title, body))
+
+def send_telegram_report(header_title="📑 交易周期汇总"):
+    """将缓冲中的消息板块汇总为一条或多条消息并发送"""
+    if not TELEGRAM_ENABLED:
+        return
+    if not _telegram_sections:
+        return
+
+    # 组装消息，控制在Telegram单条消息的长度限制内（约4096字符）
+    max_len = 3800
+    current = f"{header_title}\n\n⏰ 时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+    parts_to_send = []
+
+    for title, body in _telegram_sections:
+        section = f"\n———\n{title}\n\n{body.strip()}\n"
+        if len(current) + len(section) > max_len:
+            parts_to_send.append(current)
+            current = f"{header_title}\n"
+        current += section
+
+    if current.strip():
+        parts_to_send.append(current)
+
+    for msg in parts_to_send:
+        send_telegram_message(msg, parse_mode='HTML')
+
+    # 发送后清空缓冲
+    start_telegram_cycle()
+
 def dual_output(message, telegram_enabled=True, console_prefix="", telegram_parse_mode='HTML'):
     """
     统一输出函数：同时输出到控制台和Telegram
@@ -303,7 +355,11 @@ def dual_output(message, telegram_enabled=True, console_prefix="", telegram_pars
             import re
             telegram_message = re.sub(r'<[^>]+>', '', message)
         
-        send_telegram_message(telegram_message, telegram_parse_mode)
+        # 批量模式下加入缓冲；否则即时发送
+        if TELEGRAM_BATCH_MODE:
+            add_telegram_section("📜 日志", telegram_message)
+        else:
+            send_telegram_message(telegram_message, telegram_parse_mode)
 
 
 def log_info(message, telegram_enabled=True):
@@ -376,6 +432,48 @@ def format_balance_message(balance_info):
     return message
 
 
+def format_position_message(position):
+    """格式化持仓信息消息"""
+    if position is None:
+        return """
+📦 <b>当前持仓</b>
+
+🚫 <b>无持仓</b>
+
+⏰ <b>时间:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+""".format(datetime=datetime)
+    
+    # 计算盈亏百分比
+    pnl_percentage = 0
+    if position.get('entry_price', 0) > 0:
+        current_price = position.get('current_price', position.get('entry_price', 0))
+        if position['side'] == 'long':
+            pnl_percentage = ((current_price - position['entry_price']) / position['entry_price']) * 100
+        else:  # short
+            pnl_percentage = ((position['entry_price'] - current_price) / position['entry_price']) * 100
+    
+    # 选择方向图标
+    side_emoji = "📈" if position['side'] == 'long' else "📉"
+    side_text = "多头" if position['side'] == 'long' else "空头"
+    
+    # 选择盈亏颜色图标
+    pnl_emoji = "💚" if position.get('unrealized_pnl', 0) >= 0 else "❤️"
+    
+    message = f"""
+📦 <b>当前持仓</b>
+
+{side_emoji} <b>方向:</b> {side_text}
+📊 <b>合约:</b> {position.get('symbol', 'N/A')}
+💰 <b>数量:</b> {position.get('size', 0):.4f} 张
+💵 <b>开仓价:</b> ${position.get('entry_price', 0):,.2f}
+{pnl_emoji} <b>未实现盈亏:</b> ${position.get('unrealized_pnl', 0):,.2f} ({pnl_percentage:+.2f}%)
+⚡ <b>杠杆:</b> {position.get('leverage', 0):.0f}x
+
+⏰ <b>时间:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
+    return message
+
+
 def format_error_message(error_type, error_msg):
     """格式化错误消息"""
     return f"""
@@ -439,7 +537,11 @@ def broadcast_console_info(info_type, **kwargs):
         else:
             return
             
-        send_telegram_message(message)
+        # 批量模式下加入缓冲；否则即时发送
+        if TELEGRAM_BATCH_MODE:
+            add_telegram_section("📣 播报", message)
+        else:
+            send_telegram_message(message)
         
     except Exception as e:
         print(f"⚠️ 控制台信息播报失败: {e}")
@@ -465,8 +567,15 @@ risk_state = {
     'last_trade_time': 0,  # 上次交易时间
     'trades_today': 0,  # 今日交易次数
     'trades_this_hour': 0,  # 本小时交易次数
-    'last_hour_reset': 0,  # 上次小时重置时间
-    'last_day_reset': 0  # 上次日期重置时间
+    'last_hour_reset': 0,  # 上次小时重置时间（旧逻辑保留）
+    'last_day_reset': 0,  # 上次日期重置时间（旧逻辑保留）
+    # 🆕 使用自然时间边界的重置标记
+    'last_hour': None,  # 最近一次记录的自然小时（0-23）
+    'last_day': None,  # 最近一次记录的自然日期（date 对象）
+    # 🔒 锁盈状态
+    'profit_lock_reference_price': None,  # 锁盈参考价
+    'last_profit_lock_time': 0,  # 上次锁盈时间
+    'profit_locked_today': 0  # 当日锁盈总量（合约张数）
 }
 
 
@@ -640,24 +749,31 @@ def is_trading_allowed():
 
 
 def check_trading_frequency():
-    """检查交易频率限制"""
+    """检查交易频率限制（按自然小时/自然日边界重置）"""
     global risk_state
     
     try:
         risk_config = TRADE_CONFIG['risk_management']
         current_time = time.time()
+        now_dt = datetime.now()
+        current_hour = now_dt.hour
+        current_day = now_dt.date()
         
-        # 重置小时计数器
-        if current_time - risk_state['last_hour_reset'] >= 3600:  # 1小时
+        # 使用自然小时重置（避免滑动24小时导致午夜无法交易）
+        if risk_state.get('last_hour') is None or risk_state.get('last_hour') != current_hour:
+            if risk_state.get('last_hour') is not None:
+                log_info("⏱️ 已进入新小时，小时交易计数已重置")
             risk_state['trades_this_hour'] = 0
-            risk_state['last_hour_reset'] = current_time
+            risk_state['last_hour'] = current_hour
         
-        # 重置日计数器
-        if current_time - risk_state['last_day_reset'] >= 86400:  # 24小时
+        # 使用自然日重置（本地日期变化即重置）
+        if risk_state.get('last_day') is None or risk_state.get('last_day') != current_day:
+            if risk_state.get('last_day') is not None:
+                log_info("📆 已进入新的一天，今日交易计数已重置")
             risk_state['trades_today'] = 0
-            risk_state['last_day_reset'] = current_time
+            risk_state['last_day'] = current_day
         
-        # 检查最小交易间隔
+        # 检查最小交易间隔（秒）
         if risk_state['last_trade_time'] > 0:
             time_since_last = current_time - risk_state['last_trade_time']
             if time_since_last < risk_config['min_trade_interval']:
@@ -691,6 +807,79 @@ def update_trading_frequency():
     log_info(f"📊 交易频率统计: 本小时 {risk_state['trades_this_hour']} 次，今日 {risk_state['trades_today']} 次")
 
 
+def evaluate_profit_lock(current_price):
+    """评估并执行锁盈（可选功能）"""
+    try:
+        cfg = TRADE_CONFIG.get('risk_management', {})
+        if not cfg.get('profit_lock_enabled', False):
+            return False, "未启用锁盈"
+
+        pos = get_current_position()
+        if not pos or pos.get('size', 0) <= 0:
+            return False, "无持仓"
+
+        entry = pos.get('entry_price', 0) or 0
+        if entry <= 0:
+            return False, "入场价缺失"
+
+        # 冷却检查
+        now = time.time()
+        last_lock = risk_state.get('last_profit_lock_time', 0)
+        if now - last_lock < cfg.get('profit_lock_cooldown', 600):
+            return False, "锁盈冷却中"
+
+        # 计算收益比例（按方向）
+        if pos['side'] == 'long':
+            profit_ratio = (current_price - entry) / entry
+        else:  # short
+            profit_ratio = (entry - current_price) / entry
+
+        if profit_ratio < cfg.get('profit_lock_trigger_ratio', 0.02):
+            return False, "未达到锁盈阈值"
+
+        # 计算本次锁盈张数
+        step_ratio = cfg.get('profit_lock_step_ratio', 0.1)
+        min_contracts = cfg.get('profit_lock_min_contracts', TRADE_CONFIG.get('min_amount', 0.01))
+        step_contracts = max(min_contracts, round(pos['size'] * step_ratio, 2))
+        step_contracts = min(step_contracts, pos['size'])
+        if step_contracts <= 0:
+            return False, "锁盈张数无效"
+
+        # 下单（reduceOnly）
+        close_side = 'sell' if pos['side'] == 'long' else 'buy'
+        log_trading(f"🔒 锁盈触发: 收益比例 {profit_ratio:.2%}，执行{step_contracts:.2f}张减仓")
+        exchange.create_market_order(
+            TRADE_CONFIG['symbol'],
+            close_side,
+            step_contracts,
+            params={'reduceOnly': True, 'tag': '60bb4a8d3416BCDE'}
+        )
+
+        # 更新状态与播报
+        risk_state['last_profit_lock_time'] = now
+        risk_state['profit_locked_today'] = risk_state.get('profit_locked_today', 0) + step_contracts
+
+        section_body = (
+            f"<b>锁盈执行</b>\n"
+            f"📈 收益比例: {profit_ratio:.2%}\n"
+            f"🎯 锁盈张数: {step_contracts:.2f} 张\n"
+            f"📦 当前方向: {pos['side']}\n"
+            f"💵 现价: {current_price:.2f}, 入场价: {entry:.2f}"
+        )
+
+        if TELEGRAM_ENABLED:
+            if TELEGRAM_BATCH_MODE:
+                add_telegram_section("🔒 锁盈", section_body)
+            else:
+                send_telegram_message(section_body)
+
+        log_success("锁盈完成")
+        return True, "锁盈完成"
+    except Exception as e:
+        log_error(f"锁盈评估失败: {e}")
+        return False, f"错误: {e}"
+
+
 def reset_circuit_breaker():
     """重置熔断状态（手动调用）"""
     global risk_state
@@ -709,8 +898,9 @@ def check_profit_potential(signal_data, price_data, position_size):
         config = TRADE_CONFIG['position_management']
         current_price = price_data['price']
         
-        # 计算名义价值和手续费
-        nominal_value = position_size * current_price
+        # 统一名义价值与手续费计算（按合约规格）
+        contract_size = TRADE_CONFIG.get('contract_size', 0.01)
+        nominal_value = position_size * contract_size * current_price
         total_fee = nominal_value * config['fee_rate'] * 2  # 开平仓手续费
         
         # 根据信号强度估算盈利潜力
@@ -730,7 +920,8 @@ def check_profit_potential(signal_data, price_data, position_size):
         profit_to_fee_ratio = expected_profit / total_fee if total_fee > 0 else 0
         
         log_info(f"📊 盈亏比分析:")
-        log_info(f"   - 仓位大小: {position_size:.4f}")
+        log_info(f"   - 仓位大小: {position_size:.4f} 张")
+        log_info(f"   - 合约规格: {contract_size} /合约")
         log_info(f"   - 名义价值: {nominal_value:.2f} USDT")
         log_info(f"   - 预计手续费: {total_fee:.4f} USDT")
         log_info(f"   - 预期盈利: {expected_profit:.4f} USDT ({expected_profit_ratio:.1%})")
@@ -1463,12 +1654,17 @@ def execute_intelligent_trade(signal_data, price_data):
         log_warning(f"💸 {profit_reason}，跳过此次交易")
         return
 
-    log_trading(f"<b>交易信号生成</b>\n📊 信号: {signal_data['signal']}\n🎯 信心程度: {signal_data['confidence']}\n💰 智能仓位: {position_size:.2f} 张\n💡 理由: {signal_data['reason']}\n📦 当前持仓: {current_position}")
+    # 格式化当前持仓信息
+    position_info = "无持仓" if current_position is None else f"{current_position['side']}仓 {current_position['size']:.2f}张"
+    log_trading(f"<b>交易信号生成</b>\n📊 信号: {signal_data['signal']}\n🎯 信心程度: {signal_data['confidence']}\n💰 智能仓位: {position_size:.2f} 张\n💡 理由: {signal_data['reason']}\n📦 当前持仓: {position_info}")
     
-    # 🆕 发送Telegram交易信号通知
+    # 🆕 发送Telegram交易信号通知（批量模式优先）
     if TELEGRAM_ENABLED:
         telegram_message = format_trading_signal_message(signal_data, price_data, position_size)
-        send_telegram_message(telegram_message)
+        if TELEGRAM_BATCH_MODE:
+            add_telegram_section("🎯 交易信号", telegram_message)
+        else:
+            send_telegram_message(telegram_message)
 
     # 🆕 保证金预检查
     try:
@@ -1518,6 +1714,19 @@ def execute_intelligent_trade(signal_data, price_data):
         log_info("测试模式 - 仅模拟交易")
         return
 
+    # 🛡️ 下单前滑点保护预检
+    try:
+        ticker = exchange.fetch_ticker(TRADE_CONFIG['symbol'])
+        actual_price = float(ticker.get('last') or ticker.get('close') or price_data['price'])
+        ok, reason = check_slippage_protection(price_data['price'], actual_price)
+        if not ok:
+            log_warning(f"⛔ {reason}，跳过下单")
+            return
+        else:
+            log_info(f"✅ 滑点检查通过: {reason}")
+    except Exception as e:
+        log_warning(f"滑点保护检查失败: {e}")
+
     try:
         # 执行交易逻辑 - 支持同方向加仓减仓
         if signal_data['signal'] == 'BUY':
@@ -1550,10 +1759,13 @@ def execute_intelligent_trade(signal_data, price_data):
                     )
 
             elif current_position and current_position['side'] == 'long':
-                # 同方向，检查是否需要调整仓位
+                # 同方向，检查是否需要调整仓位（加入相对阈值）
                 size_diff = position_size - current_position['size']
+                min_amount = TRADE_CONFIG.get('min_amount', 0.01)
+                min_rel = TRADE_CONFIG['position_management'].get('min_relative_adjust_ratio', 0.0)
+                relative_diff = abs(size_diff) / max(current_position['size'], min_amount)
 
-                if abs(size_diff) >= 0.01:  # 有可调整的差异
+                if abs(size_diff) >= min_amount and relative_diff >= min_rel:  # 有可调整的差异且满足比例
                     if size_diff > 0:
                         # 加仓
                         add_size = round(size_diff, 2)
@@ -1575,7 +1787,7 @@ def execute_intelligent_trade(signal_data, price_data):
                             params={'reduceOnly': True, 'tag': '60bb4a8d3416BCDE'}
                         )
                 else:
-                    log_info(f"已有多头持仓，仓位合适保持现状 (当前:{current_position['size']:.2f}, 目标:{position_size:.2f})")
+                    log_info(f"已有多头持仓，微调未达阈值保持现状 (当前:{current_position['size']:.2f}, 目标:{position_size:.2f}, 相对差异:{relative_diff:.2%})")
             else:
                 # 无持仓时开多仓
                 log_trading(f"🟢 开多仓 {position_size:.2f} 张...")
@@ -1616,10 +1828,13 @@ def execute_intelligent_trade(signal_data, price_data):
                     )
 
             elif current_position and current_position['side'] == 'short':
-                # 同方向，检查是否需要调整仓位
+                # 同方向，检查是否需要调整仓位（加入相对阈值）
                 size_diff = position_size - current_position['size']
+                min_amount = TRADE_CONFIG.get('min_amount', 0.01)
+                min_rel = TRADE_CONFIG['position_management'].get('min_relative_adjust_ratio', 0.0)
+                relative_diff = abs(size_diff) / max(current_position['size'], min_amount)
 
-                if abs(size_diff) >= 0.01:  # 有可调整的差异
+                if abs(size_diff) >= min_amount and relative_diff >= min_rel:  # 有可调整的差异且满足比例
                     if size_diff > 0:
                         # 加仓
                         add_size = round(size_diff, 2)
@@ -1641,7 +1856,7 @@ def execute_intelligent_trade(signal_data, price_data):
                             params={'reduceOnly': True, 'tag': '60bb4a8d3416BCDE'}
                         )
                 else:
-                    log_info(f"已有空头持仓，仓位合适保持现状 (当前:{current_position['size']:.2f}, 目标:{position_size:.2f})")
+                    log_info(f"已有空头持仓，微调未达阈值保持现状 (当前:{current_position['size']:.2f}, 目标:{position_size:.2f}, 相对差异:{relative_diff:.2%})")
             else:
                 # 无持仓时开空仓
                 log_trading(f"🔴 开空仓 {position_size:.2f} 张...")
@@ -1663,7 +1878,7 @@ def execute_intelligent_trade(signal_data, price_data):
         
         time.sleep(2)
         position = get_current_position()
-        log_info(f"更新后持仓: {position}")
+        log_info(format_position_message(position))
         
         # 🆕 发送交易成功通知和余额更新
         if TELEGRAM_ENABLED:
@@ -1682,7 +1897,7 @@ def execute_intelligent_trade(signal_data, price_data):
 
 🎯 <b>执行信号:</b> {signal_data['signal']}
 💰 <b>执行仓位:</b> {position_size:.2f} 张
-📊 <b>当前持仓:</b> {position['side'] if position else '无'} {position['size'] if position else 0:.2f} 张
+📊 <b>当前持仓:</b> {'无持仓' if position is None else f"{position['side']}仓 {position['size']:.2f}张"}
 
 ⏰ <b>时间:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 """
@@ -1811,7 +2026,8 @@ def trading_bot():
 
     # 🛡️ 每日重置风险状态（在新的一天开始时）
     current_date = datetime.now().date()
-    if not hasattr(risk_state, 'last_reset_date') or risk_state.get('last_reset_date') != current_date:
+    # 修复：risk_state是字典，hasattr恒False；改为直接比对last_reset_date
+    if risk_state.get('last_reset_date') != current_date:
         risk_state['daily_pnl'] = 0.0
         risk_state['last_reset_date'] = current_date
         log_info("🔄 每日风险状态已重置")
@@ -1830,6 +2046,10 @@ def trading_bot():
                           price_change=price_data['price_change'],
                           timeframe=TRADE_CONFIG['timeframe'])
 
+    # 🧰 开启Telegram批量汇总周期
+    if TELEGRAM_ENABLED and TELEGRAM_BATCH_MODE:
+        start_telegram_cycle()
+
     # 2. 使用Bailian分析（带重试）
     signal_data = analyze_with_bailian_with_retry(price_data)
 
@@ -1845,6 +2065,16 @@ def trading_bot():
 
     # 3. 执行智能交易
     execute_intelligent_trade(signal_data, price_data)
+
+    # 🔒 可选：评估锁盈
+    try:
+        evaluate_profit_lock(price_data['price'])
+    except Exception as e:
+        log_warning(f"锁盈评估异常: {e}")
+
+    # 📨 结束本周期并发送汇总
+    if TELEGRAM_ENABLED and TELEGRAM_BATCH_MODE:
+        send_telegram_report(header_title="📑 交易周期汇总")
 
 
 def main():
