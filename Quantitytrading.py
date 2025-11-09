@@ -1224,7 +1224,7 @@ def get_sentiment_indicators():
 
 
 def get_market_trend(df):
-    """判断市场趋势"""
+    """判断市场趋势 - 增强版：添加基本趋势判断逻辑"""
     try:
         current_price = df['close'].iloc[-1]
 
@@ -1243,12 +1243,51 @@ def get_market_trend(df):
         else:
             overall_trend = "震荡整理"
 
+        # 🆕 基本趋势判断逻辑
+        # 1. 均线上下判断
+        above_sma20 = current_price > df['sma_20'].iloc[-1]
+        above_sma50 = current_price > df['sma_50'].iloc[-1]
+        
+        # 2. 均线排列判断
+        sma_bullish_alignment = df['sma_5'].iloc[-1] > df['sma_20'].iloc[-1] > df['sma_50'].iloc[-1]
+        sma_bearish_alignment = df['sma_5'].iloc[-1] < df['sma_20'].iloc[-1] < df['sma_50'].iloc[-1]
+        
+        # 3. 趋势强度判断
+        price_vs_sma20 = (current_price - df['sma_20'].iloc[-1]) / df['sma_20'].iloc[-1] * 100
+        price_vs_sma50 = (current_price - df['sma_50'].iloc[-1]) / df['sma_50'].iloc[-1] * 100
+        
+        # 4. 基本趋势方向
+        if above_sma20 and above_sma50:
+            basic_trend_direction = "多头趋势"
+            trend_strength = "强" if price_vs_sma20 > 2 and price_vs_sma50 > 2 else "中等"
+        elif not above_sma20 and not above_sma50:
+            basic_trend_direction = "空头趋势"
+            trend_strength = "强" if price_vs_sma20 < -2 and price_vs_sma50 < -2 else "中等"
+        else:
+            basic_trend_direction = "震荡整理"
+            trend_strength = "弱"
+
+        # 5. 趋势明确性判断
+        trend_clarity = "明确" if (sma_bullish_alignment or sma_bearish_alignment) and abs(price_vs_sma20) > 1 else "不明确"
+
         return {
             'short_term': trend_short,
             'medium_term': trend_medium,
             'macd': macd_trend,
             'overall': overall_trend,
-            'rsi_level': df['rsi'].iloc[-1]
+            'rsi_level': df['rsi'].iloc[-1],
+            # 🆕 新增基本趋势判断字段
+            'basic_trend': {
+                'direction': basic_trend_direction,
+                'strength': trend_strength,
+                'clarity': trend_clarity,
+                'above_sma20': above_sma20,
+                'above_sma50': above_sma50,
+                'sma_bullish_alignment': sma_bullish_alignment,
+                'sma_bearish_alignment': sma_bearish_alignment,
+                'price_vs_sma20_pct': price_vs_sma20,
+                'price_vs_sma50_pct': price_vs_sma50
+            }
         }
     except Exception as e:
         log_error(f"趋势分析失败: {e}")
@@ -1319,6 +1358,9 @@ def generate_technical_analysis_text(price_data):
     def safe_float(value, default=0):
         return float(value) if value and pd.notna(value) else default
 
+    # 🆕 获取基本趋势数据
+    basic_trend = trend.get('basic_trend', {})
+    
     analysis_text = f"""
     【技术指标分析】
     📈 移动平均线:
@@ -1331,6 +1373,15 @@ def generate_technical_analysis_text(price_data):
     - 中期趋势: {trend.get('medium_term', 'N/A')}
     - 整体趋势: {trend.get('overall', 'N/A')}
     - MACD方向: {trend.get('macd', 'N/A')}
+    
+    🎯 【基本趋势判断】:
+    - 趋势方向: {basic_trend.get('direction', 'N/A')}
+    - 趋势强度: {basic_trend.get('strength', 'N/A')}
+    - 趋势明确性: {basic_trend.get('clarity', 'N/A')}
+    - 价格在20均线: {'上方' if basic_trend.get('above_sma20', False) else '下方'}
+    - 价格在50均线: {'上方' if basic_trend.get('above_sma50', False) else '下方'}
+    - 相对20均线: {basic_trend.get('price_vs_sma20_pct', 0):+.2f}%
+    - 相对50均线: {basic_trend.get('price_vs_sma50_pct', 0):+.2f}%
 
     📊 动量指标:
     - RSI: {safe_float(tech['rsi']):.2f} ({'超买' if safe_float(tech['rsi']) > 70 else '超卖' if safe_float(tech['rsi']) < 30 else '中性'})
@@ -1486,6 +1537,13 @@ def analyze_with_bailian(price_data):
     - 短期趋势: {price_data['trend_analysis'].get('short_term', 'N/A')} 
     - RSI状态: {price_data['technical_data'].get('rsi', 0):.1f} ({'超买' if price_data['technical_data'].get('rsi', 0) > 70 else '超卖' if price_data['technical_data'].get('rsi', 0) < 30 else '中性'})
     - MACD方向: {price_data['trend_analysis'].get('macd', 'N/A')}
+    
+    【基本趋势判断 - 必须重点参考】
+    - 基本趋势方向: {price_data['trend_analysis'].get('basic_trend', {}).get('direction', 'N/A')}
+    - 趋势强度: {price_data['trend_analysis'].get('basic_trend', {}).get('strength', 'N/A')}
+    - 趋势明确性: {price_data['trend_analysis'].get('basic_trend', {}).get('clarity', 'N/A')}
+    - 价格相对20均线: {price_data['trend_analysis'].get('basic_trend', {}).get('price_vs_sma20_pct', 0):+.2f}%
+    - 价格相对50均线: {price_data['trend_analysis'].get('basic_trend', {}).get('price_vs_sma50_pct', 0):+.2f}%
 
     【智能仓位管理规则 - 必须遵守】
 
@@ -1619,6 +1677,33 @@ def execute_intelligent_trade(signal_data, price_data):
         return
 
     log_info("✅ 风险控制检查通过，允许交易")
+
+    # 🆕 趋势过滤检查 - 新增基本趋势判断逻辑
+    basic_trend = price_data['trend_analysis'].get('basic_trend', {})
+    trend_direction = basic_trend.get('direction', '震荡整理')
+    trend_clarity = basic_trend.get('clarity', '不明确')
+    
+    # 趋势过滤规则
+    if signal_data['signal'] != 'HOLD':
+        # 1. 趋势不明确时谨慎操作
+        if trend_clarity == '不明确':
+            if signal_data['confidence'] != 'HIGH':
+                log_warning(f"🔒 趋势不明确，非高信心信号，跳过交易")
+                return
+        
+        # 2. 逆趋势操作需要高信心
+        if (signal_data['signal'] == 'BUY' and trend_direction == '空头趋势') or \
+           (signal_data['signal'] == 'SELL' and trend_direction == '多头趋势'):
+            if signal_data['confidence'] != 'HIGH':
+                log_warning(f"🔒 逆趋势操作需要高信心，当前信心: {signal_data['confidence']}")
+                return
+        
+        # 3. 顺趋势操作可以放宽要求
+        if (signal_data['signal'] == 'BUY' and trend_direction == '多头趋势') or \
+           (signal_data['signal'] == 'SELL' and trend_direction == '空头趋势'):
+            log_info(f"✅ 顺趋势操作，趋势方向: {trend_direction}")
+    
+    log_info(f"📊 基本趋势判断: {trend_direction} ({trend_clarity})")
 
     current_position = get_current_position()
 
