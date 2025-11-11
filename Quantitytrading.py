@@ -1,6 +1,5 @@
 import os
 import time
-import schedule
 from openai import OpenAI
 import ccxt
 import pandas as pd
@@ -27,7 +26,6 @@ if TELEGRAM_ENABLED:
         print("✅ Telegram 配置已启用")
     else:
         print("❌ Telegram 配置不完整，将禁用通知功能")
-        TELEGRAM_ENABLED = False
         TELEGRAM_ENABLED = False
 
 # 初始化阿里云百炼客户端
@@ -56,17 +54,19 @@ TRADE_CONFIG = {
     'analysis_periods': {
         'short_term': 20,  # 短期均线
         'medium_term': 50,  # 中期均线
-        'long_term': 96  # 长期趋势
+        'long_term': 96,  # 长期趋势
+        'weekly_trend': 336,  # 周线趋势（7天*96根15分钟K线）
+        'monthly_trend': 1440  # 月线趋势（30天*48根15分钟K线）
     },
     # 新增智能仓位参数
     'position_management': {
         'enable_intelligent_position': True,  # 🆕 新增：是否启用智能仓位管理
-        'base_usdt_amount': 30,  # 🔧 增加基础仓位（原10→30 USDT）
+        'base_usdt_amount': 30,  # ⚠️ 已废弃：现在根据余额动态计算基础仓位
         'high_confidence_multiplier': 2.0,  # 🔧 提高高信心倍数（原1.5→2.0）
         'medium_confidence_multiplier': 1.2,  # 🔧 提高中等信心倍数（原1.0→1.2）
         'low_confidence_multiplier': 0.6,  # 🔧 提高低信心倍数（原0.5→0.6）
-        'max_position_ratio': 0.8,  # 
-        'trend_strength_multiplier': 1.5,  # 🔧 提高趋势强度倍数（原1.2→1.5）
+        'max_position_ratio': 0.8,  # 最大仓位比例限制
+        'trend_strength_multiplier': 1.2,  # 🔧 降低趋势强度倍数（原1.5→1.2），减少趋势权重
         'min_profit_ratio': 0.003,  # 🆕 最小盈利比例（0.3%），确保覆盖手续费
         'fee_rate': 0.0005,  # 🆕 手续费率（0.05%），用于盈亏计算
         # 新增：同方向微调的相对阈值，避免高频微调耗尽频次
@@ -694,10 +694,16 @@ def check_circuit_breaker():
         total_balance = balance['USDT']['total']
         
         if total_balance > 0:
-            daily_loss_ratio = abs(risk_state['daily_pnl']) / total_balance
-            if risk_state['daily_pnl'] < 0 and daily_loss_ratio > risk_config['max_daily_loss_ratio']:
-                risk_state['circuit_breaker_active'] = True
-                return True, f"日亏损比例{daily_loss_ratio:.2%}，触发熔断"
+            # 修正：日亏损比例应该基于初始余额计算，而不是当前余额
+            # 因为当前余额已经包含了当日的亏损
+            initial_balance = total_balance - risk_state['daily_pnl']
+            if initial_balance > 0:
+                daily_loss_ratio = abs(risk_state['daily_pnl']) / initial_balance
+                if risk_state['daily_pnl'] < 0 and daily_loss_ratio > risk_config['max_daily_loss_ratio']:
+                    risk_state['circuit_breaker_active'] = True
+                    return True, f"日亏损比例{daily_loss_ratio:.2%}，触发熔断"
+            else:
+                log_warning("⚠️ 初始余额计算异常，跳过日亏损比例检查")
     
     except Exception as e:
         log_warning(f"熔断检查失败: {e}")
@@ -730,6 +736,10 @@ def update_risk_state(trade_result):
             risk_state['consecutive_losses'] += 1
         else:
             risk_state['consecutive_losses'] = 0  # 重置连续亏损
+            
+        log_info(f"📊 风险状态更新: PNL {pnl:+.2f} USDT, 日累计 {risk_state['daily_pnl']:+.2f} USDT, 连续亏损 {risk_state['consecutive_losses']}次")
+    else:
+        log_warning("⚠️ 交易结果缺少PNL数据，无法更新风险状态")
 
 
 def is_trading_allowed():
@@ -941,6 +951,112 @@ def check_profit_potential(signal_data, price_data, position_size):
         return True, "检查失败，允许交易"  # 出错时允许交易
 
 
+def get_price_data():
+    """获取当前价格与趋势数据（轻量包装）。
+    统一为延迟队列复查提供数据结构，与主流程一致。
+    """
+    try:
+        return get_btc_ohlcv_enhanced()
+    except Exception as e:
+        log_error(f"获取价格数据失败: {e}")
+        return None
+
+
+def check_delayed_signals():
+    """
+    检查延迟执行队列中的信号，对于符合条件的信号执行交易
+    """
+    if 'delayed_signals' not in globals() or not globals()['delayed_signals']:
+        return
+    
+    current_time = time.time()
+    executed_signals = []
+    
+    for i, delayed_signal in enumerate(globals()['delayed_signals']):
+        # 检查信号是否过期（超过5分钟）
+        if current_time - delayed_signal['timestamp'] > 300:  # 5分钟过期
+            log_info(f"⏰ 延迟信号已过期: {delayed_signal['signal']} ({delayed_signal['delay_reason']})")
+            executed_signals.append(i)
+            continue
+        
+        # 获取当前市场数据重新检查趋势
+        try:
+            current_price_data = get_price_data()
+            basic_trend = current_price_data['trend_analysis'].get('basic_trend', {})
+            current_trend_direction = basic_trend.get('direction', '震荡整理')
+            current_trend_stability = basic_trend.get('stability_score', 0)
+            
+            signal_type = delayed_signal['signal']
+            
+            # 重新检查趋势确认条件
+            confirmed = True
+            reason = "趋势确认，执行延迟信号"
+            
+            # 1. 逆趋势信号需要趋势稳定性达到85%
+            if (signal_type == 'BUY' and current_trend_direction == '空头趋势') or \
+               (signal_type == 'SELL' and current_trend_direction == '多头趋势'):
+                if current_trend_stability < 85:
+                    confirmed = False
+                    reason = f"逆趋势稳定性不足: {current_trend_stability:.1f}% < 85%"
+            
+            # 2. 顺趋势信号需要稳定性达到60%
+            elif (signal_type == 'BUY' and current_trend_direction == '多头趋势') or \
+                 (signal_type == 'SELL' and current_trend_direction == '空头趋势'):
+                if current_trend_stability < 60:
+                    confirmed = False
+                    reason = f"顺趋势稳定性不足: {current_trend_stability:.1f}% < 60%"
+            
+            # 3. 震荡行情中的信号需要趋势明确
+            elif current_trend_direction == '震荡整理':
+                confirmed = False
+                reason = "仍在震荡行情中"
+            
+            if confirmed:
+                log_info(f"✅ 执行延迟信号: {signal_type} ({reason})")
+                
+                # 重新计算仓位（价格可能已变化）
+                current_position = get_current_position()
+                new_position_size = calculate_intelligent_position(
+                    {
+                        'signal': delayed_signal['signal'],
+                        'confidence': delayed_signal['confidence'],
+                        'reason': delayed_signal['reason']
+                    },
+                    current_price_data,
+                    current_position
+                )
+                
+                # 执行交易（这里需要调用实际的交易执行逻辑）
+                # 注意：这里需要根据你的交易执行函数进行调整
+                execute_trade(
+                    delayed_signal['signal'],
+                    new_position_size,
+                    current_price_data,
+                    {
+                        'signal': delayed_signal['signal'],
+                        'confidence': delayed_signal['confidence'],
+                        'reason': delayed_signal['reason']
+                    }
+                )
+                
+                executed_signals.append(i)
+                
+            else:
+                log_info(f"⏳ 延迟信号仍需等待: {signal_type} - {reason}")
+                
+        except Exception as e:
+            log_error(f"❌ 检查延迟信号时出错: {e}")
+    
+    # 移除已执行或过期的信号
+    if executed_signals:
+        # 从后往前删除，避免索引问题
+        for i in sorted(executed_signals, reverse=True):
+            if i < len(globals()['delayed_signals']):
+                globals()['delayed_signals'].pop(i)
+        
+        log_info(f"📋 延迟执行队列更新，剩余信号: {len(globals()['delayed_signals'])}")
+
+
 def safe_create_market_order(symbol, side, amount, expected_price, params=None):
     """安全的市价单执行，包含滑点保护"""
     try:
@@ -981,9 +1097,11 @@ def calculate_intelligent_position(signal_data, price_data, current_position):
         balance = exchange.fetch_balance()
         usdt_balance = balance['USDT']['free']
 
-        # 基础USDT投入
-        base_usdt = config['base_usdt_amount']
-        log_info(f"💰 可用USDT余额: {usdt_balance:.2f}, 下单基数{base_usdt}")
+        # 🆕 根据余额动态计算基础仓位 - 不再使用固定base_usdt_amount
+        # 公式：基础仓位 = 总余额 * 基础仓位比例
+        base_position_ratio = 0.05  # 5%的基础仓位比例
+        base_usdt = usdt_balance * base_position_ratio
+        log_info(f"💰 可用USDT余额: {usdt_balance:.2f}, 动态计算基础仓位: {base_usdt:.2f} USDT ({base_position_ratio:.1%})")
 
         # 根据信心程度调整 - 修复这里
         confidence_multiplier = {
@@ -1082,6 +1200,7 @@ def calculate_technical_indicators(df):
         df['sma_5'] = df['close'].rolling(window=5, min_periods=1).mean()
         df['sma_20'] = df['close'].rolling(window=20, min_periods=1).mean()
         df['sma_50'] = df['close'].rolling(window=50, min_periods=1).mean()
+        df['sma_200'] = df['close'].rolling(window=200, min_periods=1).mean()  # 添加200周期均线
 
         # 指数移动平均线
         df['ema_12'] = df['close'].ewm(span=12).mean()
@@ -1224,7 +1343,7 @@ def get_sentiment_indicators():
 
 
 def get_market_trend(df):
-    """判断市场趋势 - 增强版：添加基本趋势判断逻辑"""
+    """判断市场趋势 - 增强版：添加基本趋势判断逻辑和趋势确认机制"""
     try:
         current_price = df['close'].iloc[-1]
 
@@ -1256,19 +1375,38 @@ def get_market_trend(df):
         price_vs_sma20 = (current_price - df['sma_20'].iloc[-1]) / df['sma_20'].iloc[-1] * 100
         price_vs_sma50 = (current_price - df['sma_50'].iloc[-1]) / df['sma_50'].iloc[-1] * 100
         
-        # 4. 基本趋势方向
+        # 4. 趋势确认机制 - 检查最近3根K线的趋势一致性
+        recent_trend_consistency = 0
+        for i in range(1, 4):  # 检查最近3根K线
+            if len(df) > i:
+                price_prev = df['close'].iloc[-i-1]
+                sma20_prev = df['sma_20'].iloc[-i-1]
+                if (current_price > df['sma_20'].iloc[-1]) == (price_prev > sma20_prev):
+                    recent_trend_consistency += 1
+        
+        # 5. 趋势稳定性评分 (0-100)
+        trend_stability_score = (recent_trend_consistency / 3) * 100
+        
+        # 6. 基本趋势方向
         if above_sma20 and above_sma50:
             basic_trend_direction = "多头趋势"
-            trend_strength = "强" if price_vs_sma20 > 2 and price_vs_sma50 > 2 else "中等"
+            # 趋势强度考虑稳定性
+            if price_vs_sma20 > 2 and price_vs_sma50 > 2 and trend_stability_score > 70:
+                trend_strength = "强"
+            else:
+                trend_strength = "中等"
         elif not above_sma20 and not above_sma50:
             basic_trend_direction = "空头趋势"
-            trend_strength = "强" if price_vs_sma20 < -2 and price_vs_sma50 < -2 else "中等"
+            if price_vs_sma20 < -2 and price_vs_sma50 < -2 and trend_stability_score > 70:
+                trend_strength = "强"
+            else:
+                trend_strength = "中等"
         else:
             basic_trend_direction = "震荡整理"
             trend_strength = "弱"
 
-        # 5. 趋势明确性判断
-        trend_clarity = "明确" if (sma_bullish_alignment or sma_bearish_alignment) and abs(price_vs_sma20) > 1 else "不明确"
+        # 7. 趋势明确性判断 - 加入稳定性要求
+        trend_clarity = "明确" if (sma_bullish_alignment or sma_bearish_alignment) and abs(price_vs_sma20) > 1 and trend_stability_score > 60 else "不明确"
 
         return {
             'short_term': trend_short,
@@ -1286,11 +1424,103 @@ def get_market_trend(df):
                 'sma_bullish_alignment': sma_bullish_alignment,
                 'sma_bearish_alignment': sma_bearish_alignment,
                 'price_vs_sma20_pct': price_vs_sma20,
-                'price_vs_sma50_pct': price_vs_sma50
+                'price_vs_sma50_pct': price_vs_sma50,
+                # 🆕 新增趋势稳定性指标
+                'stability_score': trend_stability_score,
+                'recent_consistency': recent_trend_consistency
             }
         }
     except Exception as e:
         log_error(f"趋势分析失败: {e}")
+        return {}
+
+
+def analyze_long_term_trend(df):
+    """分析长期趋势（周线和月线级别）用于识别底部和顶部"""
+    try:
+        current_price = df['close'].iloc[-1]
+        
+        # 长期趋势分析 - 基于更长周期的移动平均线
+        weekly_trend = "上涨" if current_price > df['sma_50'].iloc[-1] else "下跌"
+        monthly_trend = "上涨" if current_price > df['sma_200'].iloc[-1] else "下跌"
+        
+        # 长期均线排列判断
+        long_term_bullish = df['sma_50'].iloc[-1] > df['sma_200'].iloc[-1]
+        long_term_bearish = df['sma_50'].iloc[-1] < df['sma_200'].iloc[-1]
+        
+        # 价格相对于长期均线的位置
+        price_vs_weekly = (current_price - df['sma_50'].iloc[-1]) / df['sma_50'].iloc[-1] * 100
+        price_vs_monthly = (current_price - df['sma_200'].iloc[-1]) / df['sma_200'].iloc[-1] * 100
+        
+        # 底部识别逻辑
+        is_potential_bottom = False
+        bottom_reasons = []
+        
+        # 1. 价格接近或低于长期支撑位
+        if current_price <= df['sma_200'].iloc[-1] * 1.05:  # 价格在月线支撑附近
+            is_potential_bottom = True
+            bottom_reasons.append("价格接近月线支撑")
+        
+        # 2. RSI超卖区域
+        if df['rsi'].iloc[-1] < 30:
+            is_potential_bottom = True
+            bottom_reasons.append("RSI超卖")
+        
+        # 3. 成交量放大确认
+        volume_ratio = df['volume'].iloc[-1] / df['volume'].rolling(20).mean().iloc[-1]
+        if volume_ratio > 1.5 and current_price < df['close'].iloc[-2]:  # 放量下跌
+            is_potential_bottom = True
+            bottom_reasons.append("放量下跌可能见底")
+        
+        # 顶部识别逻辑
+        is_potential_top = False
+        top_reasons = []
+        
+        # 1. 价格大幅高于长期均线
+        if current_price >= df['sma_200'].iloc[-1] * 1.20:  # 价格高于月线20%
+            is_potential_top = True
+            top_reasons.append("价格大幅偏离月线")
+        
+        # 2. RSI超买区域
+        if df['rsi'].iloc[-1] > 70:
+            is_potential_top = True
+            top_reasons.append("RSI超买")
+        
+        # 3. 成交量异常放大
+        if volume_ratio > 2.0 and current_price > df['close'].iloc[-2]:  # 放量上涨
+            is_potential_top = True
+            top_reasons.append("异常放量可能见顶")
+        
+        # 市场结构判断
+        market_structure = "健康"
+        if is_potential_bottom:
+            market_structure = "可能底部区域"
+        elif is_potential_top:
+            market_structure = "可能顶部区域"
+        elif long_term_bullish and weekly_trend == "上涨" and monthly_trend == "上涨":
+            market_structure = "强势上涨趋势"
+        elif long_term_bearish and weekly_trend == "下跌" and monthly_trend == "下跌":
+            market_structure = "强势下跌趋势"
+        else:
+            market_structure = "震荡整理"
+        
+        return {
+            'weekly_trend': weekly_trend,
+            'monthly_trend': monthly_trend,
+            'long_term_bullish': long_term_bullish,
+            'long_term_bearish': long_term_bearish,
+            'price_vs_weekly_pct': price_vs_weekly,
+            'price_vs_monthly_pct': price_vs_monthly,
+            'is_potential_bottom': is_potential_bottom,
+            'is_potential_top': is_potential_top,
+            'bottom_reasons': bottom_reasons,
+            'top_reasons': top_reasons,
+            'market_structure': market_structure,
+            'volume_ratio': volume_ratio
+        }
+        
+    except Exception as e:
+        log_error(f"长期趋势分析失败: {e}")
         return {}
 
 
@@ -1313,6 +1543,7 @@ def get_btc_ohlcv_enhanced():
         # 获取技术分析数据
         trend_analysis = get_market_trend(df)
         levels_analysis = get_support_resistance_levels(df)
+        long_term_analysis = analyze_long_term_trend(df)
 
         return {
             'price': current_data['close'],
@@ -1338,6 +1569,7 @@ def get_btc_ohlcv_enhanced():
             },
             'trend_analysis': trend_analysis,
             'levels_analysis': levels_analysis,
+            'long_term_analysis': long_term_analysis,
             'full_data': df
         }
     except Exception as e:
@@ -1360,6 +1592,8 @@ def generate_technical_analysis_text(price_data):
 
     # 🆕 获取基本趋势数据
     basic_trend = trend.get('basic_trend', {})
+    # 🆕 获取长期趋势分析数据
+    long_term = price_data.get('long_term_analysis', {})
     
     analysis_text = f"""
     【技术指标分析】
@@ -1378,10 +1612,24 @@ def generate_technical_analysis_text(price_data):
     - 趋势方向: {basic_trend.get('direction', 'N/A')}
     - 趋势强度: {basic_trend.get('strength', 'N/A')}
     - 趋势明确性: {basic_trend.get('clarity', 'N/A')}
+    - 趋势稳定性: {basic_trend.get('stability_score', 0):.1f}% ({basic_trend.get('recent_consistency', 0)}/3 K线一致)
     - 价格在20均线: {'上方' if basic_trend.get('above_sma20', False) else '下方'}
     - 价格在50均线: {'上方' if basic_trend.get('above_sma50', False) else '下方'}
     - 相对20均线: {basic_trend.get('price_vs_sma20_pct', 0):+.2f}%
     - 相对50均线: {basic_trend.get('price_vs_sma50_pct', 0):+.2f}%
+
+    🎯 【长期趋势与市场结构分析】:
+    - 周线趋势: {long_term.get('weekly_trend', 'N/A')}
+    - 月线趋势: {long_term.get('monthly_trend', 'N/A')}
+    - 长期均线排列: {'多头' if long_term.get('long_term_bullish', False) else '空头' if long_term.get('long_term_bearish', False) else '中性'}
+    - 价格相对周线: {long_term.get('price_vs_weekly_pct', 0):+.2f}%
+    - 价格相对月线: {long_term.get('price_vs_monthly_pct', 0):+.2f}%
+    - 市场结构: {long_term.get('market_structure', 'N/A')}
+    - 成交量比率: {long_term.get('volume_ratio', 0):.2f}x
+    
+    🎯 【底部顶部识别】:
+    - 潜在底部: {'是' if long_term.get('is_potential_bottom', False) else '否'} {', '.join(long_term.get('bottom_reasons', []))}
+    - 潜在顶部: {'是' if long_term.get('is_potential_top', False) else '否'} {', '.join(long_term.get('top_reasons', []))}
 
     📊 动量指标:
     - RSI: {safe_float(tech['rsi']):.2f} ({'超买' if safe_float(tech['rsi']) > 70 else '超卖' if safe_float(tech['rsi']) < 30 else '中性'})
@@ -1441,6 +1689,29 @@ def safe_json_parse(json_str):
             print(f"JSON解析失败，原始内容: {json_str}")
             print(f"错误详情: {e}")
             return None
+
+
+def normalize_confidence(conf):
+    """将置信度统一规范为'HIGH'|'MEDIUM'|'LOW'"""
+    if conf is None:
+        return "MEDIUM"
+    if isinstance(conf, (int, float)):
+        try:
+            val = float(conf)
+            if val >= 80:
+                return "HIGH"
+            if val >= 60:
+                return "MEDIUM"
+            return "LOW"
+        except Exception:
+            pass
+    s = str(conf).strip().lower()
+    mapping = {
+        'high': 'HIGH', 'h': 'HIGH', '高': 'HIGH', '強': 'HIGH', '强': 'HIGH', '🔥': 'HIGH',
+        'medium': 'MEDIUM', 'm': 'MEDIUM', '中': 'MEDIUM', '⚡': 'MEDIUM',
+        'low': 'LOW', 'l': 'LOW', '低': 'LOW', '弱': 'LOW', '💡': 'LOW'
+    }
+    return mapping.get(s, "MEDIUM")
 
 
 def create_fallback_signal(price_data):
@@ -1566,7 +1837,14 @@ def analyze_with_bailian(price_data):
        - 趋势明确反转 → 及时反向信号
        - 不要因为已有持仓而过度HOLD
 
+    【长期市场结构分析 - 新增要求】
+    - **底部区域识别**: 当价格接近月线支撑、RSI超卖、成交量放大时，可能是底部区域，应谨慎做空，考虑分批建仓
+    - **顶部区域识别**: 当价格大幅偏离月线、RSI超买、成交量异常放大时，可能是顶部区域，应谨慎做多，考虑减仓或止盈
+    - **趋势延续**: 长期趋势明确时，短期回调可能是加仓机会而不是反转信号
+    - **趋势反转**: 长期趋势与短期趋势出现明显背离时，需要警惕趋势反转的可能性
+
     【重要】请基于技术分析做出明确判断，避免因过度谨慎而错过趋势行情！
+    【特别关注】必须结合长期市场结构分析，不要只看短期K线波动！
 
     【分析要求】
     基于以上分析，请给出明确的交易信号
@@ -1615,6 +1893,9 @@ def analyze_with_bailian(price_data):
         if not all(field in signal_data for field in required_fields):
             signal_data = create_fallback_signal(price_data)
 
+        # 统一置信度格式
+        signal_data['confidence'] = normalize_confidence(signal_data.get('confidence'))
+
         # 保存信号到历史记录
         signal_data['timestamp'] = price_data['timestamp']
         signal_history.append(signal_data)
@@ -1642,6 +1923,9 @@ def analyze_with_bailian(price_data):
 def execute_intelligent_trade(signal_data, price_data):
     """执行智能交易 - OKX版本（支持同方向加仓减仓）"""
     global position, risk_state
+
+    # 统一置信度格式，确保后续趋势过滤与仓位逻辑一致
+    signal_data['confidence'] = normalize_confidence(signal_data.get('confidence'))
 
     # 🛡️ 风险控制检查
     # 1. 检查是否允许交易
@@ -1678,10 +1962,65 @@ def execute_intelligent_trade(signal_data, price_data):
 
     log_info("✅ 风险控制检查通过，允许交易")
 
-    # 🆕 趋势过滤检查 - 新增基本趋势判断逻辑
+    # 🆕 趋势确认机制 - 防止反转前夕的错误交易
+    def check_trend_confirmation(price_data, signal_data):
+        """
+        趋势确认检查：确保趋势信号稳定且一致
+        返回 (confirmed, reason)
+        """
+        basic_trend = price_data['trend_analysis'].get('basic_trend', {})
+        trend_direction = basic_trend.get('direction', '震荡整理')
+        trend_clarity = basic_trend.get('clarity', '不明确')
+        trend_stability = basic_trend.get('stability_score', 0)
+        recent_consistency = basic_trend.get('recent_consistency', 0)
+        
+        signal_type = signal_data['signal']
+        confidence = signal_data['confidence']
+        
+        # 1. 趋势稳定性检查
+        if trend_stability < 60:  # 稳定性低于60%
+            if confidence != 'HIGH':
+                return False, f"趋势稳定性不足({trend_stability:.1f}%)，非高信心信号"
+        
+        # 2. 近期一致性检查
+        if recent_consistency < 2:  # 最近3根K线中至少2根确认趋势
+            if confidence != 'HIGH':
+                return False, f"近期趋势一致性不足({recent_consistency}/3)，非高信心信号"
+        
+        # 3. 趋势方向确认
+        if trend_direction == '震荡整理' and trend_clarity == '不明确':
+            if confidence != 'HIGH':
+                return False, "震荡行情中非高信心信号"
+        
+        # 4. 逆趋势信号额外确认
+        if (signal_type == 'BUY' and trend_direction == '空头趋势') or \
+           (signal_type == 'SELL' and trend_direction == '多头趋势'):
+            # 逆趋势操作需要更高的确认标准
+            if trend_stability < 75 or recent_consistency < 3:
+                return False, f"逆趋势操作需要更高稳定性(≥75%)和完全一致性，当前稳定性:{trend_stability:.1f}%，一致性:{recent_consistency}/3"
+        
+        # 5. 顺趋势信号确认
+        if (signal_type == 'BUY' and trend_direction == '多头趋势') or \
+           (signal_type == 'SELL' and trend_direction == '空头趋势'):
+            # 顺趋势操作可以放宽，但仍需基本确认
+            if trend_stability < 40:
+                return False, f"顺趋势但稳定性过低({trend_stability:.1f}%)"
+        
+        return True, "趋势确认通过"
+    
+    # 执行趋势确认检查
+    if signal_data['signal'] != 'HOLD':
+        confirmed, confirm_reason = check_trend_confirmation(price_data, signal_data)
+        if not confirmed:
+            log_warning(f"🔒 趋势确认失败: {confirm_reason}")
+            return
+        log_info(f"✅ 趋势确认通过: {confirm_reason}")
+
+    # 🆕 趋势过滤检查 - 增强版：添加趋势稳定性检查和反转保护
     basic_trend = price_data['trend_analysis'].get('basic_trend', {})
     trend_direction = basic_trend.get('direction', '震荡整理')
     trend_clarity = basic_trend.get('clarity', '不明确')
+    trend_stability = basic_trend.get('stability_score', 0)
     
     # 趋势过滤规则
     if signal_data['signal'] != 'HOLD':
@@ -1691,19 +2030,29 @@ def execute_intelligent_trade(signal_data, price_data):
                 log_warning(f"🔒 趋势不明确，非高信心信号，跳过交易")
                 return
         
-        # 2. 逆趋势操作需要高信心
-        if (signal_data['signal'] == 'BUY' and trend_direction == '空头趋势') or \
-           (signal_data['signal'] == 'SELL' and trend_direction == '多头趋势'):
+        # 2. 趋势稳定性检查 - 新增
+        if trend_stability < 50:  # 稳定性低于50%
             if signal_data['confidence'] != 'HIGH':
-                log_warning(f"🔒 逆趋势操作需要高信心，当前信心: {signal_data['confidence']}")
+                log_warning(f"🔒 趋势稳定性不足({trend_stability:.1f}%)，非高信心信号，跳过交易")
                 return
         
-        # 3. 顺趋势操作可以放宽要求
+        # 3. 逆趋势操作需要高信心和趋势稳定性
+        if (signal_data['signal'] == 'BUY' and trend_direction == '空头趋势') or \
+           (signal_data['signal'] == 'SELL' and trend_direction == '多头趋势'):
+            # 逆趋势操作需要更高的稳定性要求
+            if signal_data['confidence'] != 'HIGH' or trend_stability < 70:
+                log_warning(f"🔒 逆趋势操作需要高信心和趋势稳定性(≥70%)，当前信心: {signal_data['confidence']}, 稳定性: {trend_stability:.1f}%")
+                return
+        
+        # 4. 顺趋势操作可以放宽要求，但仍需基本稳定性
         if (signal_data['signal'] == 'BUY' and trend_direction == '多头趋势') or \
            (signal_data['signal'] == 'SELL' and trend_direction == '空头趋势'):
-            log_info(f"✅ 顺趋势操作，趋势方向: {trend_direction}")
+            if trend_stability < 40:  # 顺趋势但稳定性太低
+                log_warning(f"⚠️ 顺趋势但稳定性不足({trend_stability:.1f}%)，谨慎操作")
+            else:
+                log_info(f"✅ 顺趋势操作，趋势方向: {trend_direction}, 稳定性: {trend_stability:.1f}%")
     
-    log_info(f"📊 基本趋势判断: {trend_direction} ({trend_clarity})")
+    log_info(f"📊 基本趋势判断: {trend_direction} ({trend_clarity}), 稳定性: {trend_stability:.1f}%")
 
     current_position = get_current_position()
 
@@ -1756,8 +2105,8 @@ def execute_intelligent_trade(signal_data, price_data):
         balance = exchange.fetch_balance()
         usdt_balance = balance['USDT']['free']
         
-        # 计算所需保证金
-        required_margin = (position_size * TRADE_CONFIG['contract_size'] * price_data['price']) / TRADE_CONFIG['leverage']
+        # 计算所需保证金（修正：合约乘数应该在分子中）
+        required_margin = (position_size * price_data['price'] * TRADE_CONFIG['contract_size']) / TRADE_CONFIG['leverage']
         
         log_info(f"<b>💳 保证金检查</b>\n💰 可用余额: {usdt_balance:.2f} USDT\n💵 所需保证金: {required_margin:.2f} USDT\n📊 安全余量: {usdt_balance - required_margin:.2f} USDT")
         
@@ -1798,6 +2147,66 @@ def execute_intelligent_trade(signal_data, price_data):
     if TRADE_CONFIG['test_mode']:
         log_info("测试模式 - 仅模拟交易")
         return
+
+    # 🆕 延迟执行检查 - 防止在反转前夕交易
+    def check_delay_execution(signal_data, price_data):
+        """
+        延迟执行检查：对于某些信号类型，等待额外确认
+        返回 (should_execute, reason)
+        """
+        basic_trend = price_data['trend_analysis'].get('basic_trend', {})
+        trend_direction = basic_trend.get('direction', '震荡整理')
+        trend_stability = basic_trend.get('stability_score', 0)
+        
+        signal_type = signal_data['signal']
+        confidence = signal_data['confidence']
+        
+        # 1. 逆趋势操作需要延迟执行（等待趋势确认）
+        if (signal_type == 'BUY' and trend_direction == '空头趋势') or \
+           (signal_type == 'SELL' and trend_direction == '多头趋势'):
+            if trend_stability < 80:  # 逆趋势但稳定性不够高
+                log_info(f"⏳ 逆趋势操作，等待趋势进一步确认 (稳定性: {trend_stability:.1f}%)")
+                return False, "逆趋势操作需要更高稳定性确认"
+        
+        # 2. 低稳定性趋势中的操作需要延迟
+        if trend_stability < 50 and confidence != 'HIGH':
+            log_info(f"⏳ 低稳定性趋势，等待确认 (稳定性: {trend_stability:.1f}%)")
+            return False, "低稳定性趋势需要额外确认"
+        
+        # 3. 震荡行情中的操作需要谨慎
+        if trend_direction == '震荡整理' and confidence != 'HIGH':
+            log_info("⏳ 震荡行情，等待趋势明确")
+            return False, "震荡行情需要趋势明确"
+        
+        return True, "立即执行"
+    
+    # 执行延迟执行检查
+    execute_now, delay_reason = check_delay_execution(signal_data, price_data)
+    if not execute_now:
+        log_warning(f"⏸️ 延迟执行: {delay_reason}")
+        
+        # 将信号加入延迟执行队列
+        if 'delayed_signals' not in globals():
+            globals()['delayed_signals'] = []
+        
+        delayed_signal = {
+            'signal': signal_data['signal'],
+            'confidence': signal_data['confidence'],
+            'reason': signal_data['reason'],
+            'price_data': price_data,
+            'position_size': position_size,
+            'timestamp': time.time(),
+            'delay_reason': delay_reason
+        }
+        
+        globals()['delayed_signals'].append(delayed_signal)
+        log_info(f"📋 信号已加入延迟执行队列，当前队列长度: {len(globals()['delayed_signals'])}")
+        
+        # 检查是否有可以执行的延迟信号
+        check_delayed_signals()
+        return
+    
+    log_info("✅ 延迟执行检查通过，立即执行交易")
 
     # 🛡️ 下单前滑点保护预检
     try:

@@ -93,7 +93,7 @@ async def test_trading_signal_format():
     # 模拟交易信号数据
     signal_data = {
         'signal': 'BUY',
-        'confidence': 85,
+        'confidence': 'HIGH',
         'reasoning': '技术指标显示强烈买入信号，RSI超卖，MACD金叉'
     }
     
@@ -108,7 +108,7 @@ async def test_trading_signal_format():
 🎯 <b>交易信号</b>
 
 📈 <b>信号:</b> {signal_data['signal']}
-🎯 <b>置信度:</b> {signal_data['confidence']}%
+🎯 <b>置信度:</b> {signal_data['confidence']}
 💰 <b>仓位:</b> {position_size:.2f} 张
 
 💡 <b>分析:</b>
