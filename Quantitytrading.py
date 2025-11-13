@@ -62,11 +62,11 @@ TRADE_CONFIG = {
     'position_management': {
         'enable_intelligent_position': True,  # 🆕 新增：是否启用智能仓位管理
         'base_usdt_amount': 30,  # ⚠️ 已废弃：现在根据余额动态计算基础仓位
-        'high_confidence_multiplier': 2.0,  # 🔧 提高高信心倍数（原1.5→2.0）
-        'medium_confidence_multiplier': 1.2,  # 🔧 提高中等信心倍数（原1.0→1.2）
-        'low_confidence_multiplier': 0.6,  # 🔧 提高低信心倍数（原0.5→0.6）
+        'high_confidence_multiplier': 3.0,  # 🔧 大幅提高高信心倍数（原2.0→3.0）
+        'medium_confidence_multiplier': 1.8,  # 🔧 大幅提高中等信心倍数（原1.2→1.8）
+        'low_confidence_multiplier': 0.8,  # 🔧 提高低信心倍数（原0.6→0.8）
         'max_position_ratio': 0.8,  # 最大仓位比例限制
-        'trend_strength_multiplier': 1.2,  # 🔧 降低趋势强度倍数（原1.5→1.2），减少趋势权重
+        'trend_strength_multiplier': 1.5,  # 🔧 提高趋势强度倍数（原1.2→1.5），增加趋势权重
         'min_profit_ratio': 0.003,  # 🆕 最小盈利比例（0.3%），确保覆盖手续费
         'fee_rate': 0.0005,  # 🆕 手续费率（0.05%），用于盈亏计算
         # 新增：同方向微调的相对阈值，避免高频微调耗尽频次
@@ -401,19 +401,14 @@ def format_trading_signal_message(signal_data, price_data, position_size):
         'LOW': '💡'
     }
     
+    # 简化消息格式，去除冗余信息
     message = f"""
-🤖 <b>量化交易信号</b>
+🤖 <b>交易信号</b>
 
-{signal_emoji.get(signal_data['signal'], '❓')} <b>信号:</b> {signal_data['signal']}
-{confidence_emoji.get(signal_data['confidence'], '❓')} <b>信心:</b> {signal_data['confidence']}
-💰 <b>仓位:</b> {position_size:.2f} 张
-💵 <b>价格:</b> ${price_data['price']:,.2f}
+{signal_emoji.get(signal_data['signal'], '❓')} {signal_data['signal']} | {confidence_emoji.get(signal_data['confidence'], '❓')} {signal_data['confidence']}
+💰 {position_size:.2f}张 | 💵 ${price_data['price']:,.2f}
 
-📊 <b>技术指标:</b>
-• RSI: {price_data.get('rsi', 'N/A')}
-• 趋势: {price_data.get('trend', 'N/A')}
-
-⏰ <b>时间:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+📊 RSI: {price_data.get('rsi', 'N/A')} | 趋势: {price_data.get('trend', 'N/A')}
 """
     return message
 
@@ -421,13 +416,11 @@ def format_trading_signal_message(signal_data, price_data, position_size):
 def format_balance_message(balance_info):
     """格式化余额信息消息"""
     message = f"""
-💳 <b>账户余额更新</b>
+💳 <b>账户余额</b>
 
-💰 <b>USDT余额:</b> {balance_info.get('usdt', 0):.2f}
-📈 <b>持仓价值:</b> {balance_info.get('position_value', 0):.2f}
-📊 <b>总资产:</b> {balance_info.get('total', 0):.2f}
-
-⏰ <b>时间:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+💰 USDT: {balance_info.get('usdt', 0):.2f}
+📈 持仓: {balance_info.get('position_value', 0):.2f}
+📊 总资产: {balance_info.get('total', 0):.2f}
 """
     return message
 
@@ -436,12 +429,10 @@ def format_position_message(position):
     """格式化持仓信息消息"""
     if position is None:
         return """
-📦 <b>当前持仓</b>
+📦 <b>持仓状态</b>
 
-🚫 <b>无持仓</b>
-
-⏰ <b>时间:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-""".format(datetime=datetime)
+🚫 无持仓
+"""
     
     # 计算盈亏百分比
     pnl_percentage = 0
@@ -454,22 +445,18 @@ def format_position_message(position):
     
     # 选择方向图标
     side_emoji = "📈" if position['side'] == 'long' else "📉"
-    side_text = "多头" if position['side'] == 'long' else "空头"
+    side_text = "多" if position['side'] == 'long' else "空"
     
     # 选择盈亏颜色图标
     pnl_emoji = "💚" if position.get('unrealized_pnl', 0) >= 0 else "❤️"
     
     message = f"""
-📦 <b>当前持仓</b>
+📦 <b>持仓状态</b>
 
-{side_emoji} <b>方向:</b> {side_text}
-📊 <b>合约:</b> {position.get('symbol', 'N/A')}
-💰 <b>数量:</b> {position.get('size', 0):.4f} 张
-💵 <b>开仓价:</b> ${position.get('entry_price', 0):,.2f}
-{pnl_emoji} <b>未实现盈亏:</b> ${position.get('unrealized_pnl', 0):,.2f} ({pnl_percentage:+.2f}%)
-⚡ <b>杠杆:</b> {position.get('leverage', 0):.0f}x
-
-⏰ <b>时间:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+{side_emoji} {side_text} | {position.get('symbol', 'N/A')}
+💰 {position.get('size', 0):.4f}张 | ⚡ {position.get('leverage', 0):.0f}x
+💵 ${position.get('entry_price', 0):,.2f}
+{pnl_emoji} ${position.get('unrealized_pnl', 0):,.2f} ({pnl_percentage:+.2f}%)
 """
     return message
 
@@ -477,12 +464,10 @@ def format_position_message(position):
 def format_error_message(error_type, error_msg):
     """格式化错误消息"""
     return f"""
-❌ <b>交易错误</b>
+❌ <b>错误</b>
 
-🚨 <b>错误类型:</b> {error_type}
-📝 <b>错误详情:</b> {error_msg}
-
-⏰ <b>时间:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+🚨 {error_type}
+📝 {error_msg[:100]}{'...' if len(error_msg) > 100 else ''}
 """
 
 def broadcast_console_info(info_type, **kwargs):
@@ -493,46 +478,40 @@ def broadcast_console_info(info_type, **kwargs):
     try:
         if info_type == "trading_start":
             message = f"""
-📊 <b>交易分析开始</b>
+📊 <b>交易分析</b>
 
-⏰ <b>执行时间:</b> {kwargs.get('timestamp', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))}
-💰 <b>当前价格:</b> ${kwargs.get('price', 0):,.2f}
-📈 <b>价格变化:</b> {kwargs.get('price_change', 0):+.2f}%
-⏱️ <b>数据周期:</b> {kwargs.get('timeframe', 'N/A')}
+⏰ {kwargs.get('timestamp', datetime.now().strftime('%H:%M:%S'))}
+💰 ${kwargs.get('price', 0):,.2f} | 📈 {kwargs.get('price_change', 0):+.2f}%
+⏱️ {kwargs.get('timeframe', 'N/A')}
 """
             
         elif info_type == "signal_generated":
-            fallback_note = "\n⚠️ 使用备用交易信号" if kwargs.get('is_fallback', False) else ""
+            fallback_note = " | ⚠️备用" if kwargs.get('is_fallback', False) else ""
             message = f"""
-🎯 <b>交易信号生成</b>
+🎯 <b>信号生成</b>
 
-📊 <b>信号:</b> {kwargs.get('signal', 'N/A')}
-🎯 <b>置信度:</b> {kwargs.get('confidence', 0)}%
-💡 <b>分析:</b> {kwargs.get('reasoning', 'N/A')[:100]}...{fallback_note}
+📊 {kwargs.get('signal', 'N/A')}{fallback_note}
+🎯 {kwargs.get('confidence', 0)}% | 💡 {kwargs.get('reasoning', 'N/A')[:80]}...
 """
             
         elif info_type == "position_calculation":
             message = f"""
-🧮 <b>仓位计算详情</b>
+🧮 <b>仓位计算</b>
 
-💰 <b>基础金额:</b> {kwargs.get('base_amount', 0)} USDT
-📊 <b>置信度倍数:</b> {kwargs.get('confidence_multiplier', 0):.1f}x
-📈 <b>趋势强度倍数:</b> {kwargs.get('trend_multiplier', 0):.1f}x
-⚡ <b>杠杆:</b> {kwargs.get('leverage', 0)}x
-💎 <b>名义价值:</b> {kwargs.get('nominal_value', 0):.2f} USDT
-🎯 <b>最终仓位:</b> {kwargs.get('position_size', 0):.4f} 张
+💰 {kwargs.get('base_amount', 0)}U | 📊 {kwargs.get('confidence_multiplier', 0):.1f}x
+📈 {kwargs.get('trend_multiplier', 0):.1f}x | ⚡ {kwargs.get('leverage', 0)}x
+💎 {kwargs.get('nominal_value', 0):.2f}U | 🎯 {kwargs.get('position_size', 0):.4f}张
 """
             
         elif info_type == "margin_check":
             message = f"""
 🔍 <b>保证金检查</b>
 
-💵 <b>可用余额:</b> {kwargs.get('available_balance', 0):.2f} USDT
-💰 <b>所需保证金:</b> {kwargs.get('required_margin', 0):.2f} USDT
-✅ <b>检查结果:</b> {kwargs.get('check_result', 'N/A')}
+💵 {kwargs.get('available_balance', 0):.2f}U | 💰 {kwargs.get('required_margin', 0):.2f}U
+✅ {kwargs.get('check_result', 'N/A')}
 """
             if kwargs.get('adjusted_size'):
-                message += f"\n🔧 <b>调整后仓位:</b> {kwargs.get('adjusted_size', 0):.4f} 张"
+                message += f"\n🔧 调整后: {kwargs.get('adjusted_size', 0):.4f}张"
                 
         else:
             return
@@ -890,6 +869,158 @@ def evaluate_profit_lock(current_price):
         return False, f"错误: {e}"
 
 
+def auto_stop_profit_loss(current_price):
+    """自动止盈止损监控 - 核心功能（新增）
+    
+    解决用户反馈的问题：明明开单点位很好，却要等到趋势反转时才平仓，
+    导致利润微薄甚至亏损。
+    
+    实现逻辑：
+    1. 持续监控持仓的止盈止损价格
+    2. 价格触及止盈或止损时立即平仓
+    3. 支持动态调整止盈止损位（移动止盈）
+    """
+    try:
+        pos = get_current_position()
+        if not pos or pos.get('size', 0) <= 0:
+            return False, "无持仓"
+
+        entry = pos.get('entry_price', 0) or 0
+        if entry <= 0:
+            return False, "入场价缺失"
+
+        # 获取当前持仓对应的信号历史，找到最近的止盈止损设置
+        current_side = 'BUY' if pos['side'] == 'long' else 'SELL'
+        
+        # 查找最近的有效信号（同方向的）
+        recent_signals = []
+        for signal in reversed(signal_history):
+            if signal.get('signal') == current_side:
+                recent_signals.append(signal)
+            if len(recent_signals) >= 3:  # 取最近3个同方向信号
+                break
+        
+        if not recent_signals:
+            return False, "无相关信号历史"
+
+        # 使用最近信号的止盈止损设置
+        last_signal = recent_signals[0]
+        stop_loss_price = last_signal.get('stop_loss', 0)
+        take_profit_price = last_signal.get('take_profit', 0)
+        
+        if stop_loss_price <= 0 or take_profit_price <= 0:
+            return False, "止盈止损价格无效"
+
+        # 计算当前盈亏比例
+        if pos['side'] == 'long':
+            profit_ratio = (current_price - entry) / entry
+            # 止盈检查
+            if current_price >= take_profit_price:
+                log_trading(f"🎯 自动止盈触发: 价格 {current_price:.2f} >= 止盈价 {take_profit_price:.2f}")
+                # 平多仓
+                exchange.create_market_order(
+                    TRADE_CONFIG['symbol'],
+                    'sell',
+                    pos['size'],
+                    params={'reduceOnly': True, 'tag': '60bb4a8d3416BCDE'}
+                )
+                log_success(f"✅ 自动止盈完成: 平多仓 {pos['size']:.2f}张")
+                return True, "止盈完成"
+            # 止损检查
+            elif current_price <= stop_loss_price:
+                log_trading(f"⚠️ 自动止损触发: 价格 {current_price:.2f} <= 止损价 {stop_loss_price:.2f}")
+                # 平多仓
+                exchange.create_market_order(
+                    TRADE_CONFIG['symbol'],
+                    'sell',
+                    pos['size'],
+                    params={'reduceOnly': True, 'tag': '60bb4a8d3416BCDE'}
+                )
+                log_success(f"✅ 自动止损完成: 平多仓 {pos['size']:.2f}张")
+                return True, "止损完成"
+        
+        else:  # short position
+            profit_ratio = (entry - current_price) / entry
+            # 止盈检查
+            if current_price <= take_profit_price:
+                log_trading(f"🎯 自动止盈触发: 价格 {current_price:.2f} <= 止盈价 {take_profit_price:.2f}")
+                # 平空仓
+                exchange.create_market_order(
+                    TRADE_CONFIG['symbol'],
+                    'buy',
+                    pos['size'],
+                    params={'reduceOnly': True, 'tag': '60bb4a8d3416BCDE'}
+                )
+                log_success(f"✅ 自动止盈完成: 平空仓 {pos['size']:.2f}张")
+                return True, "止盈完成"
+            # 止损检查
+            elif current_price >= stop_loss_price:
+                log_trading(f"⚠️ 自动止损触发: 价格 {current_price:.2f} >= 止损价 {stop_loss_price:.2f}")
+                # 平空仓
+                exchange.create_market_order(
+                    TRADE_CONFIG['symbol'],
+                    'buy',
+                    pos['size'],
+                    params={'reduceOnly': True, 'tag': '60bb4a8d3416BCDE'}
+                )
+                log_success(f"✅ 自动止损完成: 平空仓 {pos['size']:.2f}张")
+                return True, "止损完成"
+
+        # 🎯 智能止盈止损优化（新增）
+        # 1. 移动止盈：随着盈利增加，逐步上移止损位
+        if abs(profit_ratio) >= 0.005:  # 至少0.5%盈利开始移动止盈
+            if pos['side'] == 'long' and profit_ratio > 0:
+                # 多头：根据盈利比例动态调整止损位
+                if profit_ratio >= 0.03:  # 3%盈利
+                    new_stop_loss = entry * 1.02  # 保本+2%
+                elif profit_ratio >= 0.02:  # 2%盈利
+                    new_stop_loss = entry * 1.01  # 保本+1%
+                elif profit_ratio >= 0.01:  # 1%盈利
+                    new_stop_loss = entry * 1.005  # 保本+0.5%
+                else:
+                    new_stop_loss = entry * 1.001  # 保本+0.1%
+                
+                if new_stop_loss > stop_loss_price:
+                    log_info(f"📈 移动止盈: 止损位从 {stop_loss_price:.2f} 调整到 {new_stop_loss:.2f} (盈利{profit_ratio:.2%})")
+                    last_signal['stop_loss'] = new_stop_loss
+            
+            elif pos['side'] == 'short' and profit_ratio > 0:
+                # 空头：根据盈利比例动态调整止损位
+                if profit_ratio >= 0.03:  # 3%盈利
+                    new_stop_loss = entry * 0.98  # 保本-2%
+                elif profit_ratio >= 0.02:  # 2%盈利
+                    new_stop_loss = entry * 0.99  # 保本-1%
+                elif profit_ratio >= 0.01:  # 1%盈利
+                    new_stop_loss = entry * 0.995  # 保本-0.5%
+                else:
+                    new_stop_loss = entry * 0.999  # 保本-0.1%
+                
+                if new_stop_loss < stop_loss_price:
+                    log_info(f"📈 移动止盈: 止损位从 {stop_loss_price:.2f} 调整到 {new_stop_loss:.2f} (盈利{profit_ratio:.2%})")
+                    last_signal['stop_loss'] = new_stop_loss
+
+        # 2. 趋势跟踪止盈：如果趋势强劲，放宽止盈条件
+        price_data = get_btc_ohlcv_enhanced()
+        if price_data:
+            basic_trend = price_data['trend_analysis'].get('basic_trend', {})
+            trend_strength = basic_trend.get('strength_score', 0)
+            trend_direction = basic_trend.get('direction', '震荡整理')
+            
+            # 趋势强劲时，可以等待更大盈利
+            if trend_strength >= 80:  # 趋势强度80%以上
+                if (pos['side'] == 'long' and trend_direction == '多头趋势') or \
+                   (pos['side'] == 'short' and trend_direction == '空头趋势'):
+                    # 顺趋势持仓，可以等待更高盈利
+                    log_info(f"🚀 强劲趋势中，放宽止盈条件 (趋势强度: {trend_strength:.1f}%)")
+                    # 这里可以进一步优化止盈逻辑，比如动态调整止盈比例
+
+        return False, "价格未触及止盈止损"
+
+    except Exception as e:
+        log_error(f"自动止盈止损监控失败: {e}")
+        return False, f"错误: {e}"
+
+
 def reset_circuit_breaker():
     """重置熔断状态（手动调用）"""
     global risk_state
@@ -1097,39 +1228,68 @@ def calculate_intelligent_position(signal_data, price_data, current_position):
         balance = exchange.fetch_balance()
         usdt_balance = balance['USDT']['free']
 
-        # 🆕 根据余额动态计算基础仓位 - 不再使用固定base_usdt_amount
-        # 公式：基础仓位 = 总余额 * 基础仓位比例
-        base_position_ratio = 0.05  # 5%的基础仓位比例
+        # 🆕 根据余额动态计算基础仓位 - 优化仓位管理策略
+        # 基础仓位比例根据信心程度动态调整，不再是固定5%
+        base_position_ratios = {
+            'HIGH': 0.15,  # 高信心：15%基础仓位
+            'MEDIUM': 0.08,  # 中等信心：8%基础仓位  
+            'LOW': 0.03    # 低信心：3%基础仓位
+        }
+        
+        # 获取基础仓位比例
+        base_position_ratio = base_position_ratios.get(signal_data['confidence'], 0.05)
         base_usdt = usdt_balance * base_position_ratio
         log_info(f"💰 可用USDT余额: {usdt_balance:.2f}, 动态计算基础仓位: {base_usdt:.2f} USDT ({base_position_ratio:.1%})")
 
-        # 根据信心程度调整 - 修复这里
-        confidence_multiplier = {
+        # 根据信心程度调整 - 优化信心倍数
+        confidence_multipliers = {
             'HIGH': config['high_confidence_multiplier'],
-            'MEDIUM': config['medium_confidence_multiplier'],
+            'MEDIUM': config['medium_confidence_multiplier'], 
             'LOW': config['low_confidence_multiplier']
-        }.get(signal_data['confidence'], 1.0)  # 添加默认值
+        }
+        confidence_multiplier = confidence_multipliers.get(signal_data['confidence'], 1.0)
 
-        # 根据趋势强度调整
+        # 根据趋势强度调整 - 优化趋势权重
         trend = price_data['trend_analysis'].get('overall', '震荡整理')
         if trend in ['强势上涨', '强势下跌']:
             trend_multiplier = config['trend_strength_multiplier']
+        elif trend in ['上涨趋势', '下跌趋势']:
+            trend_multiplier = 1.1  # 普通趋势略微增加
         else:
-            trend_multiplier = 1.0
+            trend_multiplier = 0.9  # 震荡行情略微减少
 
-        # 根据RSI状态调整（超买超卖区域减仓）
+        # 根据RSI状态精细化调整（不再是简单的0.7倍减仓）
         rsi = price_data['technical_data'].get('rsi', 50)
-        if rsi > 75 or rsi < 25:
-            rsi_multiplier = 0.7
+        if rsi > 80 or rsi < 20:  # 极端超买超卖区域
+            rsi_multiplier = 0.6  # 大幅减仓
+        elif rsi > 75 or rsi < 25:  # 一般超买超卖区域
+            rsi_multiplier = 0.8  # 适度减仓
+        elif 40 <= rsi <= 60:  # 中性区域
+            rsi_multiplier = 1.1  # 略微增加仓位
         else:
-            rsi_multiplier = 1.0
+            rsi_multiplier = 1.0  # 正常区域
 
         # 计算建议投入USDT金额
         suggested_usdt = base_usdt * confidence_multiplier * trend_multiplier * rsi_multiplier
 
-        # 风险管理：不超过总资金的指定比例 - 删除重复定义
+        # 🆕 增加市场波动性调整因子
+        volatility = price_data['technical_data'].get('atr_percent', 0.01)
+        if volatility > 0.02:  # 高波动市场
+            volatility_multiplier = 0.8  # 减仓20%
+        elif volatility < 0.005:  # 低波动市场
+            volatility_multiplier = 1.2  # 加仓20%
+        else:
+            volatility_multiplier = 1.0
+            
+        suggested_usdt = suggested_usdt * volatility_multiplier
+
+        # 风险管理：不超过总资金的指定比例
         max_usdt = usdt_balance * config['max_position_ratio']
         final_usdt = min(suggested_usdt, max_usdt)
+        
+        # 🆕 确保最小仓位要求（至少覆盖手续费）
+        min_usdt_needed = 2.0  # 最小2u仓位确保盈利潜力
+        final_usdt = max(final_usdt, min_usdt_needed)
 
         # 正确的合约张数计算！
         # 公式：合约张数 = (投入USDT * 杠杆) / (当前价格 * 合约乘数)
@@ -2565,6 +2725,12 @@ def trading_bot():
         evaluate_profit_lock(price_data['price'])
     except Exception as e:
         log_warning(f"锁盈评估异常: {e}")
+
+    # 🎯 自动止盈止损监控（新增）
+    try:
+        auto_stop_profit_loss(price_data['price'])
+    except Exception as e:
+        log_warning(f"止盈止损监控异常: {e}")
 
     # 📨 结束本周期并发送汇总
     if TELEGRAM_ENABLED and TELEGRAM_BATCH_MODE:
