@@ -78,6 +78,9 @@
 - 达到激活盈利阈值后，按 ATR 倍数与保本缓冲计算候选止损，仅沿趋势方向移动；满足最小步进与冷却条件后更新。
 - 价格触及追踪止损即平仓（reduceOnly），并重置追踪状态。
 
+附加：支持分层止盈
+- 当 `close_all_on_hit=False` 时，系统会按 `partial_close_ratio` 部分平仓，剩余仓位继续沿追踪止盈轨迹管理。
+
 ## ⚙️ 配置说明
 
 风险控制参数在 `Quantitytrading.py` 的 `TRADE_CONFIG['risk_management']` 中配置：
@@ -103,10 +106,41 @@
         'break_even_buffer_ratio': 0.001,
         'min_step_ratio': 0.002,
         'update_cooldown': 120,
-        'close_all_on_hit': True
+        'close_all_on_hit': True,
+        'partial_close_ratio': 0.5
+    },
+    # 时间止损：在设定的K线窗口内未达到最小推进则退出
+    'time_stop': {
+        'enabled': True,
+        'window_bars': 3,
+        'min_progress_ratio': 0.004,
+        'close_all': True
+    },
+    # 结构失效退出：趋势稳定性不足或方向冲突时退出
+    'structural_exit': {
+        'enabled': True,
+        'stability_threshold': 50,
+        'require_conflict': True
     }
 }
 ```
+
+### 7. 时间止损（Assumption Validity Window）
+- 功能：入场后在设定 `window_bars` 内，若盈利推进比例未达到 `min_progress_ratio`（默认复用追踪止盈激活阈值），则认定假设未能实现，触发退出。
+- 参数：
+  - `enabled`：是否启用时间止损
+  - `window_bars`：有效期窗口（按当前周期的K线数量）
+  - `min_progress_ratio`：最小推进比例（建议与 `activation_ratio` 保持一致或略低）
+  - `close_all`：触发时是否全平
+- 说明：该机制体现“在有效期内需验证假设”，避免资金长期占用在低效持仓中。
+
+### 8. 结构失效退出（Structural Invalidation Exit）
+- 功能：当趋势分析显示稳定性低于阈值，且存在方向冲突或不明确时，触发安全退出。
+- 参数：
+  - `enabled`：是否启用结构失效退出
+  - `stability_threshold`：趋势稳定性阈值（百分制）
+  - `require_conflict`：是否仅在与持仓方向冲突时触发
+- 说明：用于在“客观结构不支持当前持仓假设”时快速止损或退出，避免在不利结构中继续消耗。
 
 ## 🔍 风险监控工具
 

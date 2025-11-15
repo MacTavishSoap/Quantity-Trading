@@ -52,11 +52,11 @@ TRADE_CONFIG = {
     'test_mode': False,  # 测试模式
     'data_points': 96,  # 24小时数据（96根15分钟K线）
     'analysis_periods': {
-        'short_term': 20,  # 短期均线
-        'medium_term': 50,  # 中期均线
-        'long_term': 96,  # 长期趋势
-        'weekly_trend': 336,  # 周线趋势（7天*96根15分钟K线）
-        'monthly_trend': 1440  # 月线趋势（30天*48根15分钟K线）
+        'short_term': 12,   # 短线动量（约3小时，15m*12）
+        'medium_term': 36,  # 会话节奏（约9小时）
+        'long_term': 96,    # 日趋势（约24小时）
+        'weekly_trend': 336,  # 保持原值（可后续优化）
+        'monthly_trend': 1440  # 保持原值（可后续优化）
     },
     # 新增智能仓位参数
     'position_management': {
@@ -73,7 +73,7 @@ TRADE_CONFIG = {
         'min_relative_adjust_ratio': 0.03  # 仅当|Δsize|/current_size≥此比例才同向调仓
     },
     # 🛡️ 风险控制参数 - 防黑天鹅和插针
-    'risk_management': {
+        'risk_management': {
         'enable_anomaly_detection': True,  # 启用价格异常检测
         'max_price_change_1m': 0.05,  # 1分钟最大价格变化（5%）
         'max_price_change_5m': 0.10,  # 5分钟最大价格变化（10%）
@@ -99,7 +99,28 @@ TRADE_CONFIG = {
             'break_even_buffer_ratio': 0.001,  # 首次保本缓冲（0.1%）
             'min_step_ratio': 0.002,     # 止损更新的最小步进（0.2%）
             'update_cooldown': 120,      # 止损更新冷却时间（秒）
-            'close_all_on_hit': True     # 触发即全仓平仓
+            'close_all_on_hit': True,    # 触发即全仓平仓
+            'partial_close_ratio': 0.5   # 非全平时的部分平仓比例
+        },
+        # ⏳ 时间止损：在设定的K线窗口内未达到最小推进则退出
+        'time_stop': {
+            'enabled': True,
+            'window_bars': 2,            # 短线更紧，2根K线未推进则退出
+            'min_progress_ratio': 0.004, # 最小推进比例（保持）
+            'close_all': True            # 触发则全平
+        },
+        # 🧱 结构失效退出：趋势稳定性不足或方向冲突时退出
+        'structural_exit': {
+            'enabled': True,
+            'stability_threshold': 50,   # 趋势稳定性阈值（百分制）
+            'require_conflict': True     # 需要方向冲突时才触发
+        },
+        # 🆕 均线噪音过滤：用于过滤噪音区，避免将均线当作直接信号
+        'moving_average_filter': {
+            'enabled': True,            # 启用均线噪音过滤
+            'band_ema12_pct': 0.6,      # 缩紧短线噪音带（±0.6%），对应EMA12
+            'band_ema36_pct': 1.0,      # 缩紧中线噪音带（±1.0%），对应EMA36
+            'apply_to_non_high_confidence_only': True  # 仅过滤非高置信度信号
         }
     }
 }
@@ -561,7 +582,17 @@ risk_state = {
     'position_low_price': None,       # 持仓期间的最低价（空头）
     'last_trailing_update_time': 0,   # 最近一次追踪止损更新的时间戳
     # 🆕 AI融合的动态追踪参数（若存在则优先使用）
-    'dynamic_trailing_cfg': None
+    'dynamic_trailing_cfg': None,
+    # 🧭 战役状态：跟踪同方向交易的有效期与推进情况
+    'campaign': {
+        'start_time': 0,
+        'bars_elapsed': 0,
+        'side': None,
+        'entry_price': None,
+        'mae': 0.0,
+        'mfe': 0.0,
+        'planned_R': None
+    }
 }
 
 
@@ -863,8 +894,8 @@ def auto_stop_profit_loss(price_data):
             risk_state['position_low_price'] = min(prev_low, current_price)
             profit_ratio = (entry - current_price) / entry
 
-        # 未达到激活盈利比例则不启动追踪
-        if profit_ratio < cfg.get('activation_ratio', 0.004):
+        # 未达到激活盈利比例则不启动追踪（仅在未初始化时进行门槛检查）
+        if risk_state.get('trailing_stop_price') is None and profit_ratio < cfg.get('activation_ratio', 0.004):
             return False, "未达追踪激活阈值"
 
         atr_mult = cfg.get('atr_multiplier', 2.5)
@@ -904,35 +935,192 @@ def auto_stop_profit_loss(price_data):
             return False, "追踪止损未初始化"
 
         if side == 'long' and current_price <= stop_price:
-            log_trading(f"🎯 追踪止盈触发(多): 价格 {current_price:.2f} ≤ 止损 {stop_price:.2f}")
+            # 平仓策略：支持全平或部分平仓
+            close_all = cfg.get('close_all_on_hit', True)
+            partial_ratio = float(cfg.get('partial_close_ratio', 0.5))
+            min_amount = TRADE_CONFIG.get('min_amount', 0.01)
+            size_to_close = pos['size'] if close_all else max(min_amount, round(pos['size'] * partial_ratio, 2))
+            log_trading(f"🎯 追踪止盈触发(多): 价格 {current_price:.2f} ≤ 止损 {stop_price:.2f} | 平仓数量 {size_to_close:.2f}")
             exchange.create_market_order(
-                TRADE_CONFIG['symbol'], 'sell', pos['size'],
+                TRADE_CONFIG['symbol'], 'sell', size_to_close,
                 params={'reduceOnly': True, 'tag': '60bb4a8d3416BCDE'}
             )
-            log_success(f"✅ 平多仓 {pos['size']:.2f} 张")
-            # 重置状态
-            risk_state['trailing_stop_price'] = None
-            risk_state['position_high_price'] = None
-            risk_state['last_trailing_update_time'] = 0
+            if close_all:
+                log_success(f"✅ 全平多仓 {pos['size']:.2f} 张")
+                # 重置状态（全平时）
+                risk_state['trailing_stop_price'] = None
+                risk_state['position_high_price'] = None
+                risk_state['last_trailing_update_time'] = 0
+            else:
+                log_success(f"✅ 部分平多仓 {size_to_close:.2f} 张，继续追踪")
             return True, "追踪止盈完成"
 
         if side == 'short' and current_price >= stop_price:
-            log_trading(f"🎯 追踪止盈触发(空): 价格 {current_price:.2f} ≥ 止损 {stop_price:.2f}")
+            # 平仓策略：支持全平或部分平仓
+            close_all = cfg.get('close_all_on_hit', True)
+            partial_ratio = float(cfg.get('partial_close_ratio', 0.5))
+            min_amount = TRADE_CONFIG.get('min_amount', 0.01)
+            size_to_close = pos['size'] if close_all else max(min_amount, round(pos['size'] * partial_ratio, 2))
+            log_trading(f"🎯 追踪止盈触发(空): 价格 {current_price:.2f} ≥ 止损 {stop_price:.2f} | 平仓数量 {size_to_close:.2f}")
             exchange.create_market_order(
-                TRADE_CONFIG['symbol'], 'buy', pos['size'],
+                TRADE_CONFIG['symbol'], 'buy', size_to_close,
                 params={'reduceOnly': True, 'tag': '60bb4a8d3416BCDE'}
             )
-            log_success(f"✅ 平空仓 {pos['size']:.2f} 张")
-            # 重置状态
-            risk_state['trailing_stop_price'] = None
-            risk_state['position_low_price'] = None
-            risk_state['last_trailing_update_time'] = 0
+            if close_all:
+                log_success(f"✅ 全平空仓 {pos['size']:.2f} 张")
+                # 重置状态（全平时）
+                risk_state['trailing_stop_price'] = None
+                risk_state['position_low_price'] = None
+                risk_state['last_trailing_update_time'] = 0
+            else:
+                log_success(f"✅ 部分平空仓 {size_to_close:.2f} 张，继续追踪")
             return True, "追踪止盈完成"
 
         return False, "继续持有，追踪止盈未触发"
 
     except Exception as e:
         log_error(f"追踪止盈异常: {e}")
+        return False, f"错误: {e}"
+
+
+def update_campaign_state(pos):
+    """维护战役（campaign）状态：定位起始、累计bars"""
+    try:
+        global risk_state
+        if not pos or pos.get('size', 0) <= 0:
+            # 无持仓时重置
+            risk_state['campaign'] = {'start_time': 0, 'bars_elapsed': 0, 'side': None, 'entry_price': None, 'mae': 0.0, 'mfe': 0.0, 'planned_R': None}
+            return
+        camp = risk_state.get('campaign', {})
+        is_new = camp.get('side') != pos.get('side') or not camp.get('entry_price') or abs((camp.get('entry_price') or 0) - (pos.get('entry_price') or 0)) > 1e-8
+        if is_new or camp.get('start_time', 0) == 0:
+            risk_state['campaign'] = {
+                'start_time': time.time(),
+                'bars_elapsed': 0,
+                'side': pos.get('side'),
+                'entry_price': pos.get('entry_price'),
+                'mae': 0.0,
+                'mfe': 0.0,
+                'planned_R': 1.0  # 预设R值骨架，可根据策略计算更新
+            }
+        else:
+            # 每周期递增一次bars
+            risk_state['campaign']['bars_elapsed'] = int(risk_state['campaign'].get('bars_elapsed', 0)) + 1
+    except Exception as e:
+        log_warning(f"更新战役状态失败: {e}")
+
+
+def update_campaign_metrics(price_data):
+    """基于当前价格更新MAE/MFE骨架度量"""
+    try:
+        pos = get_current_position()
+        camp = risk_state.get('campaign', {})
+        if not pos or not camp or camp.get('entry_price') in (None, 0):
+            return
+        entry = float(camp.get('entry_price'))
+        current = float(price_data.get('price'))
+        side = pos.get('side')
+        if entry <= 0 or current is None:
+            return
+        if side == 'long':
+            run_up = max(0.0, (current - entry) / entry)
+            drawdown = max(0.0, (entry - current) / entry)
+        else:
+            run_up = max(0.0, (entry - current) / entry)
+            drawdown = max(0.0, (current - entry) / entry)
+        risk_state['campaign']['mfe'] = max(float(camp.get('mfe', 0.0) or 0.0), run_up)
+        risk_state['campaign']['mae'] = max(float(camp.get('mae', 0.0) or 0.0), drawdown)
+    except Exception as e:
+        log_warning(f"更新战役度量失败: {e}")
+
+
+def monitor_position_exits(price_data):
+    """额外退出机制监控：时间止损与结构失效退出"""
+    try:
+        pos = get_current_position()
+        if not pos or pos.get('size', 0) <= 0:
+            return False, "无持仓"
+
+        # 更新战役状态（bars累计）
+        update_campaign_state(pos)
+        camp = risk_state.get('campaign', {})
+
+        # 基础数据
+        current_price = price_data.get('price')
+        entry = pos.get('entry_price', 0) or 0
+        side = pos.get('side')
+        if entry <= 0 or current_price is None:
+            return False, "入场或现价缺失"
+
+        # 选取动态或默认时间止损/追踪参数作为最小推进参考
+        trailing_cfg = risk_state.get('dynamic_trailing_cfg') or TRADE_CONFIG.get('risk_management', {}).get('trailing_stop', {})
+        effective_time_stop_cfg = risk_state.get('dynamic_time_stop_cfg') or TRADE_CONFIG['risk_management'].get('time_stop', {})
+        min_prog = float(effective_time_stop_cfg.get('min_progress_ratio', trailing_cfg.get('activation_ratio', 0.004)))
+
+        # 计算利润比例
+        profit_ratio = (current_price - entry) / entry if side == 'long' else (entry - current_price) / entry
+
+        # 更新战役MAE/MFE骨架度量
+        update_campaign_metrics(price_data)
+
+        # ⏳ 时间止损
+        ts_cfg = risk_state.get('dynamic_time_stop_cfg') or TRADE_CONFIG['risk_management'].get('time_stop', {})
+        if ts_cfg.get('enabled', False):
+            window_bars = int(ts_cfg.get('window_bars', 3))
+            if int(camp.get('bars_elapsed', 0)) >= window_bars and profit_ratio < float(min_prog):
+                if TRADE_CONFIG.get('test_mode'):
+                    log_info(f"⏳ 测试模式时间止损：窗口{window_bars}bars未达推进 {profit_ratio:.2%} < {min_prog:.2%}")
+                else:
+                    log_trading(f"⏳ 时间止损触发：窗口{window_bars}bars未达推进 {profit_ratio:.2%} < {min_prog:.2%}")
+                    side_close = 'sell' if side == 'long' else 'buy'
+                    exchange.create_market_order(
+                        TRADE_CONFIG['symbol'], side_close, pos['size'],
+                        params={'reduceOnly': True, 'tag': 'time_stop_exit'}
+                    )
+                    log_success("✅ 时间止损退出")
+                # 重置战役与追踪状态
+                risk_state['campaign'] = {'start_time': 0, 'bars_elapsed': 0, 'side': None, 'entry_price': None}
+                risk_state['trailing_stop_price'] = None
+                risk_state['position_high_price'] = None
+                risk_state['position_low_price'] = None
+                risk_state['last_trailing_update_time'] = 0
+                return True, "时间止损"
+
+        # 🧱 结构失效退出
+        se_cfg = risk_state.get('dynamic_structural_exit_cfg') or TRADE_CONFIG['risk_management'].get('structural_exit', {})
+        if se_cfg.get('enabled', False):
+            basic_trend = (price_data.get('trend_analysis') or {}).get('basic_trend', {})
+            direction = basic_trend.get('direction', '震荡整理')
+            clarity = basic_trend.get('clarity', '不明确')
+            stability = float(basic_trend.get('stability_score', 0) or 0)
+            conflict = (side == 'long' and direction == '空头趋势') or (side == 'short' and direction == '多头趋势')
+            threshold = float(se_cfg.get('stability_threshold', 50))
+            require_conflict = bool(se_cfg.get('require_conflict', True))
+
+            should_exit = (stability < threshold and clarity == '不明确') or (stability < threshold and (not require_conflict or conflict)) or (require_conflict and conflict and stability < threshold)
+
+            if should_exit:
+                if TRADE_CONFIG.get('test_mode'):
+                    log_info(f"🧱 测试模式结构失效退出：方向{direction} 稳定性{stability:.1f}%")
+                else:
+                    log_trading(f"🧱 结构失效退出：方向{direction} 稳定性{stability:.1f}%")
+                    side_close = 'sell' if side == 'long' else 'buy'
+                    exchange.create_market_order(
+                        TRADE_CONFIG['symbol'], side_close, pos['size'],
+                        params={'reduceOnly': True, 'tag': 'structural_exit'}
+                    )
+                    log_success("✅ 结构失效退出完成")
+                # 重置战役与追踪状态
+                risk_state['campaign'] = {'start_time': 0, 'bars_elapsed': 0, 'side': None, 'entry_price': None}
+                risk_state['trailing_stop_price'] = None
+                risk_state['position_high_price'] = None
+                risk_state['position_low_price'] = None
+                risk_state['last_trailing_update_time'] = 0
+                return True, "结构失效退出"
+
+        return False, "未触发额外退出"
+    except Exception as e:
+        log_warning(f"额外退出监控异常: {e}")
         return False, f"错误: {e}"
 
 
@@ -1031,7 +1219,7 @@ def check_delayed_signals():
             basic_trend = current_price_data['trend_analysis'].get('basic_trend', {})
             current_trend_direction = basic_trend.get('direction', '震荡整理')
             current_trend_stability = basic_trend.get('stability_score', 0)
-            current_price_vs_sma20_pct = basic_trend.get('price_vs_sma20_pct', 0)
+            current_price_vs_ema12_pct = basic_trend.get('price_vs_ema12_pct', 0)
             long_term = current_price_data.get('long_term_analysis', {})
             long_market_structure = long_term.get('market_structure', 'N/A')
             long_bias = long_term.get('market_bias', '中性')
@@ -1044,10 +1232,10 @@ def check_delayed_signals():
             confirmed = True
             reason = "趋势确认，执行延迟信号"
 
-            # A. 晚入场保护：距离EMA20过远（非高置信度信号）
-            if abs(current_price_vs_sma20_pct) > 2.0 and confidence != 'HIGH':
+            # A. 晚入场保护：距离EMA12过远（非高置信度信号）
+            if abs(current_price_vs_ema12_pct) > 2.0 and confidence != 'HIGH':
                 confirmed = False
-                reason = f"离20均线过远({current_price_vs_sma20_pct:+.2f}%)"
+                reason = f"离EMA12过远({current_price_vs_ema12_pct:+.2f}%)"
 
             # B. 多周期一致性：1小时趋势需同向（非高置信度信号）
             if confirmed:
@@ -1116,17 +1304,15 @@ def check_delayed_signals():
                     current_position
                 )
                 
-                # 执行交易（这里需要调用实际的交易执行逻辑）
-                # 注意：这里需要根据你的交易执行函数进行调整
-                execute_trade(
-                    delayed_signal['signal'],
-                    new_position_size,
-                    current_price_data,
+                # 使用智能交易执行，自动计算与管理仓位与风控
+                execute_intelligent_trade(
                     {
                         'signal': delayed_signal['signal'],
                         'confidence': delayed_signal['confidence'],
-                        'reason': delayed_signal['reason']
-                    }
+                        'reason': delayed_signal['reason'],
+                        'risk_control': delayed_signal.get('risk_control', {})
+                    },
+                    current_price_data
                 )
                 
                 executed_signals.append(i)
@@ -1324,6 +1510,8 @@ def calculate_technical_indicators(df):
         # 指数移动平均线
         df['ema_20'] = df['close'].ewm(span=20).mean()
         df['ema_12'] = df['close'].ewm(span=12).mean()
+        df['ema_36'] = df['close'].ewm(span=36).mean()
+        df['ema_96'] = df['close'].ewm(span=96).mean()
         df['ema_26'] = df['close'].ewm(span=26).mean()
         df['macd'] = df['ema_12'] - df['ema_26']
         df['macd_signal'] = df['macd'].ewm(span=9).mean()
@@ -1477,8 +1665,9 @@ def get_market_trend(df):
         current_price = df['close'].iloc[-1]
 
         # 多时间框架趋势分析
-        trend_short = "上涨" if current_price > df['ema_20'].iloc[-1] else "下跌"
-        trend_medium = "上涨" if current_price > df['sma_50'].iloc[-1] else "下跌"
+        # 短线/中线改为EMA体系：12/36
+        trend_short = "上涨" if current_price > df['ema_12'].iloc[-1] else "下跌"
+        trend_medium = "上涨" if current_price > df['ema_36'].iloc[-1] else "下跌"
 
         # MACD趋势
         macd_trend = "bullish" if df['macd'].iloc[-1] > df['macd_signal'].iloc[-1] else "bearish"
@@ -1493,24 +1682,30 @@ def get_market_trend(df):
 
         # 🆕 基本趋势判断逻辑
         # 1. 均线上下判断
-        above_sma20 = current_price > df['ema_20'].iloc[-1]
-        above_sma50 = current_price > df['sma_50'].iloc[-1]
+        # 统一到EMA：12/36（保留字段名以兼容下游引用）
+        above_sma20 = current_price > df['ema_12'].iloc[-1]
+        above_sma50 = current_price > df['ema_36'].iloc[-1]
+        # 明确EMA命名，保持与SMA命名一致值以兼容
+        above_ema12 = above_sma20
+        above_ema36 = above_sma50
         
         # 2. 均线排列判断
-        sma_bullish_alignment = df['sma_5'].iloc[-1] > df['sma_20'].iloc[-1] > df['sma_50'].iloc[-1]
-        sma_bearish_alignment = df['sma_5'].iloc[-1] < df['sma_20'].iloc[-1] < df['sma_50'].iloc[-1]
+        # 使用EMA排列替代SMA：快速线（12）与中线（36）的多空关系
+        sma_bullish_alignment = df['ema_12'].iloc[-1] > df['ema_36'].iloc[-1]
+        sma_bearish_alignment = df['ema_12'].iloc[-1] < df['ema_36'].iloc[-1]
         
         # 3. 趋势强度判断
-        price_vs_sma20 = (current_price - df['ema_20'].iloc[-1]) / df['ema_20'].iloc[-1] * 100
-        price_vs_sma50 = (current_price - df['sma_50'].iloc[-1]) / df['sma_50'].iloc[-1] * 100
+        # 距离度量统一到EMA：12/36
+        price_vs_sma20 = (current_price - df['ema_12'].iloc[-1]) / (df['ema_12'].iloc[-1] or 1) * 100
+        price_vs_sma50 = (current_price - df['ema_36'].iloc[-1]) / (df['ema_36'].iloc[-1] or 1) * 100
         
         # 4. 趋势确认机制 - 检查最近3根K线的趋势一致性
         recent_trend_consistency = 0
         for i in range(1, 4):  # 检查最近3根K线
             if len(df) > i:
                 price_prev = df['close'].iloc[-i-1]
-                ema20_prev = df['ema_20'].iloc[-i-1]
-                if (current_price > df['ema_20'].iloc[-1]) == (price_prev > ema20_prev):
+                ema12_prev = df['ema_12'].iloc[-i-1]
+                if (current_price > df['ema_12'].iloc[-1]) == (price_prev > ema12_prev):
                     recent_trend_consistency += 1
         
         # 5. 趋势稳定性评分 (0-100)
@@ -1550,10 +1745,15 @@ def get_market_trend(df):
                 'clarity': trend_clarity,
                 'above_sma20': above_sma20,
                 'above_sma50': above_sma50,
+                'above_ema12': above_ema12,
+                'above_ema36': above_ema36,
                 'sma_bullish_alignment': sma_bullish_alignment,
                 'sma_bearish_alignment': sma_bearish_alignment,
                 'price_vs_sma20_pct': price_vs_sma20,
                 'price_vs_sma50_pct': price_vs_sma50,
+                # 新增EMA字段，明确标注
+                'price_vs_ema12_pct': price_vs_sma20,
+                'price_vs_ema36_pct': price_vs_sma50,
                 # 🆕 新增趋势稳定性指标
                 'stability_score': trend_stability_score,
                 'recent_consistency': recent_trend_consistency
@@ -1916,8 +2116,8 @@ def generate_technical_analysis_text(price_data):
     【技术指标分析】
     📈 移动平均线:
     - 5周期: {safe_float(tech['sma_5']):.2f} | 价格相对: {(price_data['price'] - safe_float(tech['sma_5'])) / safe_float(tech['sma_5']) * 100:+.2f}%
-    - 20周期EMA: {safe_float(tech.get('ema_20', 0)):.2f} | 价格相对: {(price_data['price'] - safe_float(tech.get('ema_20', 0))) / (safe_float(tech.get('ema_20', 0)) or 1) * 100:+.2f}%
-    - 50周期: {safe_float(tech['sma_50']):.2f} | 价格相对: {(price_data['price'] - safe_float(tech['sma_50'])) / safe_float(tech['sma_50']) * 100:+.2f}%
+    - 12周期EMA: {safe_float(tech.get('ema_12', 0)):.2f} | 价格相对: {(price_data['price'] - safe_float(tech.get('ema_12', 0))) / (safe_float(tech.get('ema_12', 0)) or 1) * 100:+.2f}%
+    - 36周期EMA: {safe_float(tech.get('ema_36', 0)):.2f} | 价格相对: {(price_data['price'] - safe_float(tech.get('ema_36', 0))) / (safe_float(tech.get('ema_36', 0)) or 1) * 100:+.2f}%
 
     🎯 趋势分析:
     - 短期趋势: {trend.get('short_term', 'N/A')}
@@ -1930,10 +2130,10 @@ def generate_technical_analysis_text(price_data):
     - 趋势强度: {basic_trend.get('strength', 'N/A')}
     - 趋势明确性: {basic_trend.get('clarity', 'N/A')}
     - 趋势稳定性: {basic_trend.get('stability_score', 0):.1f}% ({basic_trend.get('recent_consistency', 0)}/3 K线一致)
-    - 价格在20均线: {'上方' if basic_trend.get('above_sma20', False) else '下方'}
-    - 价格在50均线: {'上方' if basic_trend.get('above_sma50', False) else '下方'}
-    - 相对20均线: {basic_trend.get('price_vs_sma20_pct', 0):+.2f}%
-    - 相对50均线: {basic_trend.get('price_vs_sma50_pct', 0):+.2f}%
+    - 价格在快速均线(EMA12): {'上方' if basic_trend.get('above_ema12', False) else '下方'}
+    - 价格在中线(EMA36): {'上方' if basic_trend.get('above_ema36', False) else '下方'}
+    - 相对EMA12: {basic_trend.get('price_vs_ema12_pct', 0):+.2f}%
+    - 相对EMA36: {basic_trend.get('price_vs_ema36_pct', 0):+.2f}%
 
     🎯 【长期趋势与市场结构分析】:
     - 周线趋势: {long_term.get('weekly_trend', 'N/A')}
@@ -2120,9 +2320,17 @@ def analyze_with_bailian(price_data):
     - 强势上涨趋势 → BUY信号
     - 强势下跌趋势 → SELL信号  
     - 仅在窄幅震荡、无明确方向时 → HOLD信号
-    7. **技术指标权重**:
-    - 趋势(均线排列) > RSI > MACD > 布林带
-    - 价格突破关键支撑/阻力位是重要信号 
+    7. **趋势结构认知**:
+    - 以均线位置和结构稳定度理解趋势，不以均线交叉直接下指令
+    - 价格突破关键支撑/阻力位作为结构变化的重要依据 
+
+    【均线角色与使用原则】
+    - EMA20 反映波段强弱；距离过大视为晚入场风险，用于噪音过滤与延迟执行。
+    - EMA50 反映多空力量；与 EMA20 是否同向决定力量一致性，用于仓位调制。
+    - EMA100 反映趋势强弱；与 EMA50 是否同向决定趋势可信度，用于门槛判定。
+    - EMA200 反映牛熊；逆大级别（牛市做空/熊市做多）需更高确认与更保守风控。
+    - 均线不直接产生交易信号，仅作为“噪音过滤 + 执行约束 + 风控联动”的依据。
+    - 若出现贴线绕线（价格在短期均线附近反复穿越）且趋势稳定性不足，优先延迟或降仓。
 
 
     【当前技术状况分析】
@@ -2135,8 +2343,8 @@ def analyze_with_bailian(price_data):
     - 基本趋势方向: {price_data['trend_analysis'].get('basic_trend', {}).get('direction', 'N/A')}
     - 趋势强度: {price_data['trend_analysis'].get('basic_trend', {}).get('strength', 'N/A')}
     - 趋势明确性: {price_data['trend_analysis'].get('basic_trend', {}).get('clarity', 'N/A')}
-    - 价格相对20均线: {price_data['trend_analysis'].get('basic_trend', {}).get('price_vs_sma20_pct', 0):+.2f}%
-    - 价格相对50均线: {price_data['trend_analysis'].get('basic_trend', {}).get('price_vs_sma50_pct', 0):+.2f}%
+    - 价格相对EMA12: {price_data['trend_analysis'].get('basic_trend', {}).get('price_vs_ema12_pct', 0):+.2f}%
+    - 价格相对EMA36: {price_data['trend_analysis'].get('basic_trend', {}).get('price_vs_ema36_pct', 0):+.2f}%
 
     【智能仓位管理规则 - 必须遵守】
 
@@ -2184,6 +2392,22 @@ def analyze_with_bailian(price_data):
                 "min_step_ratio": 数值(可选),
                 "update_cooldown": 数值(秒, 可选),
                 "aggressiveness": "aggressive|balanced|conservative"(可选)
+            }},
+            "noise_filter": {{
+                "enabled": true|false(可选),
+                "ema20_distance_pct_max": 数值(可选),
+                "ema50_distance_pct_max": 数值(可选),
+                "ema100_distance_pct_max": 数值(可选),
+                "ema200_distance_pct_max": 数值(可选),
+                "stability_min": 数值(可选),
+                "alignment_required": true|false(可选),
+                "regime": "trend|range|volatile"(可选)
+            }},
+            "execution_modulation": {{
+                "size_multiplier_template": "aggressive|balanced|conservative"(可选),
+                "trailing_template": "aggressive|balanced|conservative"(可选),
+                "time_stop_template": "short|normal|long"(可选),
+                "structural_exit_template": "strict|normal|loose"(可选)
             }}
         }}
     }}
@@ -2194,7 +2418,7 @@ def analyze_with_bailian(price_data):
             model=MODEL_NAME,
             messages=[
                 {"role": "system",
-                 "content": f"您是一位急需资金来治疗母亲疾病的专业交易员，你需要从加密货币市场获得足够的资金用于治疗你的母亲，专注于{TRADE_CONFIG['timeframe']}周期趋势分析。请结合K线形态和技术指标做出判断，并严格遵循JSON格式要求。"},
+                 "content": f"你是一位专业的市场分析助手，专注于{TRADE_CONFIG['timeframe']}周期的趋势结构分析与风险边界建议。请结合K线形态与技术指标做出结构化判断，并严格遵循JSON格式，避免情绪化及非结构化输出。"},
                 {"role": "user", "content": prompt}
             ],
             stream=False,
@@ -2340,6 +2564,54 @@ def analyze_with_bailian(price_data):
                 log_info(f"🧪 动态追踪参数: {dynamic_cfg}")
         except Exception as e:
             log_warning(f"动态追踪参数处理失败: {e}")
+
+        # 🆕 融合AI建议的噪音过滤与执行模板（若提供）
+        try:
+            rc = signal_data.get('risk_control', {}) or {}
+            # 动态均线噪音过滤配置
+            nf = rc.get('noise_filter', {}) or {}
+            def sf(v, default=None):
+                try:
+                    return float(v)
+                except Exception:
+                    return default
+            dynamic_ma_filter_cfg = {
+                'ema20_distance_pct_max': sf(nf.get('ema20_distance_pct_max'), None),
+                'ema50_distance_pct_max': sf(nf.get('ema50_distance_pct_max'), None),
+                'ema100_distance_pct_max': sf(nf.get('ema100_distance_pct_max'), None),
+                'ema200_distance_pct_max': sf(nf.get('ema200_distance_pct_max'), None),
+                'stability_min': sf(nf.get('stability_min'), None),
+                'alignment_required': bool(nf.get('alignment_required')) if nf.get('alignment_required') is not None else None,
+                'enabled': bool(nf.get('enabled')) if nf.get('enabled') is not None else None,
+                'regime': (nf.get('regime') or None)
+            }
+            dynamic_ma_filter_cfg = {k: v for k, v in dynamic_ma_filter_cfg.items() if v is not None}
+            if dynamic_ma_filter_cfg:
+                risk_state['dynamic_ma_filter_cfg'] = dynamic_ma_filter_cfg
+                log_info(f"🧪 动态均线过滤参数: {dynamic_ma_filter_cfg}")
+
+            # 执行调制模板：映射到时间止损与结构退出动态覆盖
+            emod = rc.get('execution_modulation', {}) or {}
+            ts_tpl = (emod.get('time_stop_template') or '').lower()
+            se_tpl = (emod.get('structural_exit_template') or '').lower()
+            ts_templates = {
+                'short': {'window_bars': 2, 'min_progress_ratio': 0.003, 'close_all': True},
+                'normal': {'window_bars': 3, 'min_progress_ratio': 0.004, 'close_all': True},
+                'long': {'window_bars': 4, 'min_progress_ratio': 0.005, 'close_all': True},
+            }
+            se_templates = {
+                'strict': {'stability_threshold': 60, 'require_conflict': False, 'enabled': True},
+                'normal': {'stability_threshold': 50, 'require_conflict': True, 'enabled': True},
+                'loose': {'stability_threshold': 40, 'require_conflict': True, 'enabled': True},
+            }
+            if ts_tpl in ts_templates:
+                risk_state['dynamic_time_stop_cfg'] = ts_templates[ts_tpl]
+                log_info(f"🧪 动态时间止损模板: {ts_tpl} → {ts_templates[ts_tpl]}")
+            if se_tpl in se_templates:
+                risk_state['dynamic_structural_exit_cfg'] = se_templates[se_tpl]
+                log_info(f"🧪 动态结构退出模板: {se_tpl} → {se_templates[se_tpl]}")
+        except Exception as e:
+            log_warning(f"动态噪音过滤/执行模板处理失败: {e}")
 
         # 信号统计
         signal_count = len([s for s in signal_history if s.get('signal') == signal_data['signal']])
@@ -2495,6 +2767,58 @@ def execute_intelligent_trade(signal_data, price_data):
 
     current_position = get_current_position()
 
+    # 🧹 均线噪音过滤：均线用于过滤噪音，不直接给出信号
+    def is_noise_zone(price_data):
+        basic_trend = price_data.get('trend_analysis', {}).get('basic_trend', {})
+        dv_ema12 = abs(float(basic_trend.get('price_vs_ema12_pct', 0) or 0))
+        dv_ema36 = abs(float(basic_trend.get('price_vs_ema36_pct', 0) or 0))
+        cfg_static = TRADE_CONFIG.get('risk_management', {}).get('moving_average_filter', {})
+        cfg_dynamic = risk_state.get('dynamic_ma_filter_cfg') or {}
+        # 优先使用动态配置的启用开关，其次静态
+        enabled = cfg_dynamic.get('enabled', cfg_static.get('enabled', False))
+        if not enabled:
+            return False, "均线噪音过滤未启用"
+        # 动态键保持兼容（ema20/ema50），静态回退改为EMA12/EMA36配置
+        thr_ema12 = float(cfg_dynamic.get('ema20_distance_pct_max', cfg_static.get('band_ema12_pct', 0.6)))
+        thr_ema36 = float(cfg_dynamic.get('ema50_distance_pct_max', cfg_static.get('band_ema36_pct', 1.0)))
+        within_ema12 = dv_ema12 <= thr_ema12
+        within_ema36 = dv_ema36 <= thr_ema36
+        noise = within_ema12 and within_ema36
+        # 根据稳定性与趋势明确性叠加过滤（动态建议）
+        stability_min = cfg_dynamic.get('stability_min')
+        trend_clarity = basic_trend.get('clarity', '不明确')
+        alignment_required = bool(cfg_dynamic.get('alignment_required')) if cfg_dynamic.get('alignment_required') is not None else False
+
+        reason_core = f"EMA12距:{dv_ema12:.2f}%≤{thr_ema12:.2f}%, EMA36距:{dv_ema36:.2f}%≤{thr_ema36:.2f}%"
+        extra_reasons = []
+        if stability_min is not None:
+            st = float(basic_trend.get('stability_score', 0) or 0)
+            if st < stability_min:
+                noise = True
+                extra_reasons.append(f"稳定性不足({st:.1f}%<{stability_min:.1f}%)")
+        if alignment_required and trend_clarity == '不明确':
+            noise = True
+            extra_reasons.append("趋势明确性不足")
+
+        if noise:
+            reason = f"价格处于噪音带 | {reason_core}"
+            if extra_reasons:
+                reason += " | " + ", ".join(extra_reasons)
+        else:
+            reason = f"价格脱离噪音带 | {reason_core}"
+        return noise, reason
+        return noise, reason
+
+    if signal_data['signal'] != 'HOLD':
+        noise, noise_reason = is_noise_zone(price_data)
+        maf_cfg = TRADE_CONFIG.get('risk_management', {}).get('moving_average_filter', {})
+        if noise:
+            # 过滤非高置信度信号，或当配置要求时也可对所有信号过滤
+            only_non_high = bool(maf_cfg.get('apply_to_non_high_confidence_only', True))
+            if (only_non_high and signal_data['confidence'] != 'HIGH') or (not only_non_high):
+                log_warning(f"🧹 均线噪音过滤: {noise_reason}，跳过交易")
+                return
+
     # 防止频繁反转的逻辑保持不变
     if current_position and signal_data['signal'] != 'HOLD':
         current_side = current_position['side']  # 'long' 或 'short'
@@ -2596,7 +2920,7 @@ def execute_intelligent_trade(signal_data, price_data):
         basic_trend = price_data['trend_analysis'].get('basic_trend', {})
         trend_direction = basic_trend.get('direction', '震荡整理')
         trend_stability = basic_trend.get('stability_score', 0)
-        price_vs_sma20_pct = basic_trend.get('price_vs_sma20_pct', 0)
+        price_vs_ema12_pct = basic_trend.get('price_vs_ema12_pct', 0)
         long_term = price_data.get('long_term_analysis', {})
         long_market_structure = long_term.get('market_structure', 'N/A')
         long_bias = long_term.get('market_bias', '中性')
@@ -2606,8 +2930,8 @@ def execute_intelligent_trade(signal_data, price_data):
         confidence = signal_data['confidence']
 
         # 0. 晚入场保护：价格远离20EMA过多（±2%），降低非高置信度信号的执行
-        if abs(price_vs_sma20_pct) > 2.0 and confidence != 'HIGH':
-            return False, f"离20均线过远({price_vs_sma20_pct:+.2f}%)，等待回调"
+        if abs(price_vs_ema12_pct) > 2.0 and confidence != 'HIGH':
+            return False, f"离EMA12过远({price_vs_ema12_pct:+.2f}%)，等待回调"
 
         # 0.1 多周期一致性：1小时趋势需同向（对非高置信度信号生效）
         hour_trend_dir = None
@@ -3034,6 +3358,12 @@ def trading_bot():
 
     # 3. 执行智能交易
     execute_intelligent_trade(signal_data, price_data)
+
+    # ⏳🧱 额外退出机制：时间止损与结构失效退出
+    try:
+        monitor_position_exits(price_data)
+    except Exception as e:
+        log_warning(f"退出机制监控异常: {e}")
 
     # 🎯 统一：ATR稳定追踪止盈监控
     try:
