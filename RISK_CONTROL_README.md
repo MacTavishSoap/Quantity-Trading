@@ -4,6 +4,8 @@
 
 本交易系统已集成完整的风险控制机制，专门用于防范"黑天鹅"事件和"插针"等极端市场情况。
 
+此外，系统支持基于 ATR 与 AI 建议融合的“追踪止盈”机制，可在趋势行情中更好地放宽盈利空间，在震荡或不确定环境下适度收紧止盈保护。
+
 ## 🔧 风险控制功能
 
 ### 1. 价格异常检测 (Price Anomaly Detection)
@@ -38,6 +40,44 @@
 - **功能**: 手动或自动紧急停止所有交易
 - **保护**: 在检测到系统异常时立即停止交易
 
+### 6. 追踪止盈（ATR + AI融合）
+- **功能**: 结合 ATR（平均真实波动范围）与 AI 的策略建议，动态设定追踪止盈的参数，使止盈轨迹既稳健又具有策略自适应性。
+- **参数来源**:
+  1) 全局默认：`TRADE_CONFIG['risk_management']['trailing_stop']`
+  2) AI建议（优先级更高）：在分析阶段，AI可返回 `risk_control.trailing_stop` 字段（可选），系统将写入 `risk_state['dynamic_trailing_cfg']` 并优先使用。
+- **可用参数**:
+  - `atr_multiplier`：ATR倍数，决定止损轨迹距离（推荐范围 1.5–5.0）
+  - `activation_ratio`：激活盈利比例，达到后启动追踪（推荐范围 0.1%–2%）
+  - `break_even_buffer_ratio`：保本缓冲比例，首段保护至保本上/下方（推荐范围 0–1%）
+  - `min_step_ratio`：最小步进比例，满足后更新止损（推荐范围 0.05%–1%）
+  - `update_cooldown`：更新冷却秒数，避免频繁抖动（推荐范围 30–600 秒）
+  - `aggressiveness`：`aggressive|balanced|conservative`（可选），用于给出风格倾向模板
+- **边界钳制**：系统会对上述参数进行范围校验与钳制，超出范围的值将被自动限制在合理区间内。
+
+#### AI 输出示例
+```json
+{
+  "signal": "BUY",
+  "reason": "……",
+  "confidence": "HIGH",
+  "risk_control": {
+    "trailing_stop": {
+      "atr_multiplier": 2.8,
+      "activation_ratio": 0.004,
+      "break_even_buffer_ratio": 0.0012,
+      "min_step_ratio": 0.002,
+      "update_cooldown": 120,
+      "aggressiveness": "balanced"
+    }
+  }
+}
+```
+
+#### 运行机制简述
+- 无持仓时，追踪状态会重置。
+- 达到激活盈利阈值后，按 ATR 倍数与保本缓冲计算候选止损，仅沿趋势方向移动；满足最小步进与冷却条件后更新。
+- 价格触及追踪止损即平仓（reduceOnly），并重置追踪状态。
+
 ## ⚙️ 配置说明
 
 风险控制参数在 `Quantitytrading.py` 的 `TRADE_CONFIG['risk_management']` 中配置：
@@ -57,6 +97,14 @@
     'price_deviation_threshold': 0.03,    # 价格偏离阈值3%
     'volatility_window': 20,              # 波动率窗口20周期
     'anomaly_cooldown': 300               # 异常冷却时间5分钟
+    'trailing_stop': {
+        'atr_multiplier': 2.5,
+        'activation_ratio': 0.004,
+        'break_even_buffer_ratio': 0.001,
+        'min_step_ratio': 0.002,
+        'update_cooldown': 120,
+        'close_all_on_hit': True
+    }
 }
 ```
 

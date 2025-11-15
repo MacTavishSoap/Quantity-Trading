@@ -91,12 +91,16 @@ TRADE_CONFIG = {
         'min_trade_interval': 900,  # 最小交易间隔（15分钟 = 900秒）
         'max_trades_per_hour': 6,  # 每小时最大交易次数
         'max_trades_per_day': 40,  # 每日最大交易次数
-        # 🔒 锁盈（可选）配置
-        'profit_lock_enabled': False,  # 是否启用锁盈机制（默认关闭）
-        'profit_lock_trigger_ratio': 0.02,  # 触发锁盈的收益比例（2%）
-        'profit_lock_step_ratio': 0.2,  # 每次锁盈的合约比例（例如20%）
-        'profit_lock_cooldown': 600,  # 锁盈冷却时间（秒）
-        'profit_lock_min_contracts': 0.01  # 每次最少锁盈的合约张数
+        # 🎯 追踪止盈（唯一保留的锁盈方式）
+        'trailing_stop': {
+            'atr_window': 14,            # ATR窗口
+            'atr_multiplier': 2.5,       # ATR倍数（2.0-3.0较稳健）
+            'activation_ratio': 0.004,   # 启动追踪的最低盈利比例（0.4%）
+            'break_even_buffer_ratio': 0.001,  # 首次保本缓冲（0.1%）
+            'min_step_ratio': 0.002,     # 止损更新的最小步进（0.2%）
+            'update_cooldown': 120,      # 止损更新冷却时间（秒）
+            'close_all_on_hit': True     # 触发即全仓平仓
+        }
     }
 }
 
@@ -551,10 +555,13 @@ risk_state = {
     # 🆕 使用自然时间边界的重置标记
     'last_hour': None,  # 最近一次记录的自然小时（0-23）
     'last_day': None,  # 最近一次记录的自然日期（date 对象）
-    # 🔒 锁盈状态
-    'profit_lock_reference_price': None,  # 锁盈参考价
-    'last_profit_lock_time': 0,  # 上次锁盈时间
-    'profit_locked_today': 0  # 当日锁盈总量（合约张数）
+    # 🎯 追踪止盈状态（仅保留）
+    'trailing_stop_price': None,      # 当前追踪止损价格
+    'position_high_price': None,      # 持仓期间的最高价（多头）
+    'position_low_price': None,       # 持仓期间的最低价（空头）
+    'last_trailing_update_time': 0,   # 最近一次追踪止损更新的时间戳
+    # 🆕 AI融合的动态追踪参数（若存在则优先使用）
+    'dynamic_trailing_cfg': None
 }
 
 
@@ -796,228 +803,136 @@ def update_trading_frequency():
     log_info(f"📊 交易频率统计: 本小时 {risk_state['trades_this_hour']} 次，今日 {risk_state['trades_today']} 次")
 
 
-def evaluate_profit_lock(current_price):
-    """评估并执行锁盈（可选功能）"""
-    try:
-        cfg = TRADE_CONFIG.get('risk_management', {})
-        if not cfg.get('profit_lock_enabled', False):
-            return False, "未启用锁盈"
-
-        pos = get_current_position()
-        if not pos or pos.get('size', 0) <= 0:
-            return False, "无持仓"
-
-        entry = pos.get('entry_price', 0) or 0
-        if entry <= 0:
-            return False, "入场价缺失"
-
-        # 冷却检查
-        now = time.time()
-        last_lock = risk_state.get('last_profit_lock_time', 0)
-        if now - last_lock < cfg.get('profit_lock_cooldown', 600):
-            return False, "锁盈冷却中"
-
-        # 计算收益比例（按方向）
-        if pos['side'] == 'long':
-            profit_ratio = (current_price - entry) / entry
-        else:  # short
-            profit_ratio = (entry - current_price) / entry
-
-        if profit_ratio < cfg.get('profit_lock_trigger_ratio', 0.02):
-            return False, "未达到锁盈阈值"
-
-        # 计算本次锁盈张数
-        step_ratio = cfg.get('profit_lock_step_ratio', 0.1)
-        min_contracts = cfg.get('profit_lock_min_contracts', TRADE_CONFIG.get('min_amount', 0.01))
-        step_contracts = max(min_contracts, round(pos['size'] * step_ratio, 2))
-        step_contracts = min(step_contracts, pos['size'])
-        if step_contracts <= 0:
-            return False, "锁盈张数无效"
-
-        # 下单（reduceOnly）
-        close_side = 'sell' if pos['side'] == 'long' else 'buy'
-        log_trading(f"🔒 锁盈触发: 收益比例 {profit_ratio:.2%}，执行{step_contracts:.2f}张减仓")
-        exchange.create_market_order(
-            TRADE_CONFIG['symbol'],
-            close_side,
-            step_contracts,
-            params={'reduceOnly': True, 'tag': '60bb4a8d3416BCDE'}
-        )
-
-        # 更新状态与播报
-        risk_state['last_profit_lock_time'] = now
-        risk_state['profit_locked_today'] = risk_state.get('profit_locked_today', 0) + step_contracts
-
-        section_body = (
-            f"<b>锁盈执行</b>\n"
-            f"📈 收益比例: {profit_ratio:.2%}\n"
-            f"🎯 锁盈张数: {step_contracts:.2f} 张\n"
-            f"📦 当前方向: {pos['side']}\n"
-            f"💵 现价: {current_price:.2f}, 入场价: {entry:.2f}"
-        )
-
-        if TELEGRAM_ENABLED:
-            if TELEGRAM_BATCH_MODE:
-                add_telegram_section("🔒 锁盈", section_body)
-            else:
-                send_telegram_message(section_body)
-
-        log_success("锁盈完成")
-        return True, "锁盈完成"
-    except Exception as e:
-        log_error(f"锁盈评估失败: {e}")
-        return False, f"错误: {e}"
+    # 已删除：锁盈减仓逻辑，改用统一的ATR追踪止盈
 
 
-def auto_stop_profit_loss(current_price):
-    """自动止盈止损监控 - 核心功能（新增）
-    
-    解决用户反馈的问题：明明开单点位很好，却要等到趋势反转时才平仓，
-    导致利润微薄甚至亏损。
-    
-    实现逻辑：
-    1. 持续监控持仓的止盈止损价格
-    2. 价格触及止盈或止损时立即平仓
-    3. 支持动态调整止盈止损位（移动止盈）
+def auto_stop_profit_loss(price_data):
+    """ATR稳定追踪止盈（统一版）
+
+    仅使用追踪止盈：
+    - 激活条件：达到最小盈利比例 `activation_ratio`
+    - 止损轨迹：
+      多头使用 `position_high_price - ATR*multiplier`，同时首段保障至保本缓冲上方；
+      空头使用 `position_low_price + ATR*multiplier`，同时首段保障至保本缓冲下方。
+    - 稳定更新：满足最小步进 `min_step_ratio` 且冷却结束 `update_cooldown` 才更新。
+    - 触发方式：价格触及追踪止损即全平（可配置）。
     """
     try:
         pos = get_current_position()
         if not pos or pos.get('size', 0) <= 0:
+            # 无持仓时，重置追踪状态
+            risk_state['trailing_stop_price'] = None
+            risk_state['position_high_price'] = None
+            risk_state['position_low_price'] = None
+            risk_state['last_trailing_update_time'] = 0
             return False, "无持仓"
 
+        # 优先使用AI/趋势融合生成的动态参数
+        cfg = risk_state.get('dynamic_trailing_cfg') or TRADE_CONFIG.get('risk_management', {}).get('trailing_stop', {})
+        current_price = price_data.get('price')
         entry = pos.get('entry_price', 0) or 0
-        if entry <= 0:
-            return False, "入场价缺失"
+        if entry <= 0 or current_price is None:
+            return False, "入场或现价缺失"
 
-        # 获取当前持仓对应的信号历史，找到最近的止盈止损设置
-        current_side = 'BUY' if pos['side'] == 'long' else 'SELL'
-        
-        # 查找最近的有效信号（同方向的）
-        recent_signals = []
-        for signal in reversed(signal_history):
-            if signal.get('signal') == current_side:
-                recent_signals.append(signal)
-            if len(recent_signals) >= 3:  # 取最近3个同方向信号
-                break
-        
-        if not recent_signals:
-            return False, "无相关信号历史"
+        side = pos.get('side')  # 'long' 或 'short'
+        now = time.time()
 
-        # 使用最近信号的止盈止损设置
-        last_signal = recent_signals[0]
-        stop_loss_price = last_signal.get('stop_loss', 0)
-        take_profit_price = last_signal.get('take_profit', 0)
-        
-        if stop_loss_price <= 0 or take_profit_price <= 0:
-            return False, "止盈止损价格无效"
+        # 取最新ATR（若缺失，使用最近K线高低价差回退）
+        df = price_data.get('full_data')
+        atr = None
+        if df is not None and 'atr' in df.columns:
+            last_row = df.iloc[-1]
+            atr_val = last_row.get('atr')
+            try:
+                atr = float(atr_val) if atr_val is not None else None
+            except Exception:
+                atr = None
+        if atr is None or atr <= 0:
+            # 回退使用当前k线的高低价差
+            high = price_data.get('high', current_price)
+            low = price_data.get('low', current_price)
+            atr = abs(float(high) - float(low)) or max(1e-6, abs(current_price * 0.001))
 
-        # 计算当前盈亏比例
-        if pos['side'] == 'long':
+        # 更新持仓高/低价与盈利比例
+        if side == 'long':
+            prev_high = risk_state.get('position_high_price') or entry
+            risk_state['position_high_price'] = max(prev_high, current_price)
             profit_ratio = (current_price - entry) / entry
-            # 止盈检查
-            if current_price >= take_profit_price:
-                log_trading(f"🎯 自动止盈触发: 价格 {current_price:.2f} >= 止盈价 {take_profit_price:.2f}")
-                # 平多仓
-                exchange.create_market_order(
-                    TRADE_CONFIG['symbol'],
-                    'sell',
-                    pos['size'],
-                    params={'reduceOnly': True, 'tag': '60bb4a8d3416BCDE'}
-                )
-                log_success(f"✅ 自动止盈完成: 平多仓 {pos['size']:.2f}张")
-                return True, "止盈完成"
-            # 止损检查
-            elif current_price <= stop_loss_price:
-                log_trading(f"⚠️ 自动止损触发: 价格 {current_price:.2f} <= 止损价 {stop_loss_price:.2f}")
-                # 平多仓
-                exchange.create_market_order(
-                    TRADE_CONFIG['symbol'],
-                    'sell',
-                    pos['size'],
-                    params={'reduceOnly': True, 'tag': '60bb4a8d3416BCDE'}
-                )
-                log_success(f"✅ 自动止损完成: 平多仓 {pos['size']:.2f}张")
-                return True, "止损完成"
-        
-        else:  # short position
+        else:
+            prev_low = risk_state.get('position_low_price') or entry
+            risk_state['position_low_price'] = min(prev_low, current_price)
             profit_ratio = (entry - current_price) / entry
-            # 止盈检查
-            if current_price <= take_profit_price:
-                log_trading(f"🎯 自动止盈触发: 价格 {current_price:.2f} <= 止盈价 {take_profit_price:.2f}")
-                # 平空仓
-                exchange.create_market_order(
-                    TRADE_CONFIG['symbol'],
-                    'buy',
-                    pos['size'],
-                    params={'reduceOnly': True, 'tag': '60bb4a8d3416BCDE'}
-                )
-                log_success(f"✅ 自动止盈完成: 平空仓 {pos['size']:.2f}张")
-                return True, "止盈完成"
-            # 止损检查
-            elif current_price >= stop_loss_price:
-                log_trading(f"⚠️ 自动止损触发: 价格 {current_price:.2f} >= 止损价 {stop_loss_price:.2f}")
-                # 平空仓
-                exchange.create_market_order(
-                    TRADE_CONFIG['symbol'],
-                    'buy',
-                    pos['size'],
-                    params={'reduceOnly': True, 'tag': '60bb4a8d3416BCDE'}
-                )
-                log_success(f"✅ 自动止损完成: 平空仓 {pos['size']:.2f}张")
-                return True, "止损完成"
 
-        # 🎯 智能止盈止损优化（新增）
-        # 1. 移动止盈：随着盈利增加，逐步上移止损位
-        if abs(profit_ratio) >= 0.005:  # 至少0.5%盈利开始移动止盈
-            if pos['side'] == 'long' and profit_ratio > 0:
-                # 多头：根据盈利比例动态调整止损位
-                if profit_ratio >= 0.03:  # 3%盈利
-                    new_stop_loss = entry * 1.02  # 保本+2%
-                elif profit_ratio >= 0.02:  # 2%盈利
-                    new_stop_loss = entry * 1.01  # 保本+1%
-                elif profit_ratio >= 0.01:  # 1%盈利
-                    new_stop_loss = entry * 1.005  # 保本+0.5%
-                else:
-                    new_stop_loss = entry * 1.001  # 保本+0.1%
-                
-                if new_stop_loss > stop_loss_price:
-                    log_info(f"📈 移动止盈: 止损位从 {stop_loss_price:.2f} 调整到 {new_stop_loss:.2f} (盈利{profit_ratio:.2%})")
-                    last_signal['stop_loss'] = new_stop_loss
-            
-            elif pos['side'] == 'short' and profit_ratio > 0:
-                # 空头：根据盈利比例动态调整止损位
-                if profit_ratio >= 0.03:  # 3%盈利
-                    new_stop_loss = entry * 0.98  # 保本-2%
-                elif profit_ratio >= 0.02:  # 2%盈利
-                    new_stop_loss = entry * 0.99  # 保本-1%
-                elif profit_ratio >= 0.01:  # 1%盈利
-                    new_stop_loss = entry * 0.995  # 保本-0.5%
-                else:
-                    new_stop_loss = entry * 0.999  # 保本-0.1%
-                
-                if new_stop_loss < stop_loss_price:
-                    log_info(f"📈 移动止盈: 止损位从 {stop_loss_price:.2f} 调整到 {new_stop_loss:.2f} (盈利{profit_ratio:.2%})")
-                    last_signal['stop_loss'] = new_stop_loss
+        # 未达到激活盈利比例则不启动追踪
+        if profit_ratio < cfg.get('activation_ratio', 0.004):
+            return False, "未达追踪激活阈值"
 
-        # 2. 趋势跟踪止盈：如果趋势强劲，放宽止盈条件
-        price_data = get_btc_ohlcv_enhanced()
-        if price_data:
-            basic_trend = price_data['trend_analysis'].get('basic_trend', {})
-            trend_strength = basic_trend.get('strength_score', 0)
-            trend_direction = basic_trend.get('direction', '震荡整理')
-            
-            # 趋势强劲时，可以等待更大盈利
-            if trend_strength >= 80:  # 趋势强度80%以上
-                if (pos['side'] == 'long' and trend_direction == '多头趋势') or \
-                   (pos['side'] == 'short' and trend_direction == '空头趋势'):
-                    # 顺趋势持仓，可以等待更高盈利
-                    log_info(f"🚀 强劲趋势中，放宽止盈条件 (趋势强度: {trend_strength:.1f}%)")
-                    # 这里可以进一步优化止盈逻辑，比如动态调整止盈比例
+        atr_mult = cfg.get('atr_multiplier', 2.5)
+        min_step_ratio = cfg.get('min_step_ratio', 0.002)
+        cooldown = cfg.get('update_cooldown', 120)
+        break_even_buf = cfg.get('break_even_buffer_ratio', 0.001)
 
-        return False, "价格未触及止盈止损"
+        # 计算候选追踪止损价
+        if side == 'long':
+            high_water = risk_state.get('position_high_price') or current_price
+            candidate = max(entry * (1 + break_even_buf), high_water - atr_mult * atr)
+            old = risk_state.get('trailing_stop_price')
+            # 仅上移
+            new_stop = candidate if old is None else max(old, candidate)
+            step_diff_ratio = abs((new_stop - (old or new_stop)) / entry)
+        else:  # short
+            low_water = risk_state.get('position_low_price') or current_price
+            candidate = min(entry * (1 - break_even_buf), low_water + atr_mult * atr)
+            old = risk_state.get('trailing_stop_price')
+            # 仅下移
+            new_stop = candidate if old is None else min(old, candidate)
+            step_diff_ratio = abs(((old or new_stop) - new_stop) / entry)
+
+        # 冷却与步进判断后更新
+        if risk_state.get('trailing_stop_price') is None or (
+            now - risk_state.get('last_trailing_update_time', 0) >= cooldown and step_diff_ratio >= min_step_ratio
+        ):
+            risk_state['trailing_stop_price'] = new_stop
+            risk_state['last_trailing_update_time'] = now
+            log_trading(
+                f"🧷 更新追踪止损: {new_stop:.2f} | ATR {atr:.2f} | 盈利 {profit_ratio:.2%}"
+            )
+
+        # 触发平仓
+        stop_price = risk_state.get('trailing_stop_price')
+        if stop_price is None:
+            return False, "追踪止损未初始化"
+
+        if side == 'long' and current_price <= stop_price:
+            log_trading(f"🎯 追踪止盈触发(多): 价格 {current_price:.2f} ≤ 止损 {stop_price:.2f}")
+            exchange.create_market_order(
+                TRADE_CONFIG['symbol'], 'sell', pos['size'],
+                params={'reduceOnly': True, 'tag': '60bb4a8d3416BCDE'}
+            )
+            log_success(f"✅ 平多仓 {pos['size']:.2f} 张")
+            # 重置状态
+            risk_state['trailing_stop_price'] = None
+            risk_state['position_high_price'] = None
+            risk_state['last_trailing_update_time'] = 0
+            return True, "追踪止盈完成"
+
+        if side == 'short' and current_price >= stop_price:
+            log_trading(f"🎯 追踪止盈触发(空): 价格 {current_price:.2f} ≥ 止损 {stop_price:.2f}")
+            exchange.create_market_order(
+                TRADE_CONFIG['symbol'], 'buy', pos['size'],
+                params={'reduceOnly': True, 'tag': '60bb4a8d3416BCDE'}
+            )
+            log_success(f"✅ 平空仓 {pos['size']:.2f} 张")
+            # 重置状态
+            risk_state['trailing_stop_price'] = None
+            risk_state['position_low_price'] = None
+            risk_state['last_trailing_update_time'] = 0
+            return True, "追踪止盈完成"
+
+        return False, "继续持有，追踪止盈未触发"
 
     except Exception as e:
-        log_error(f"自动止盈止损监控失败: {e}")
+        log_error(f"追踪止盈异常: {e}")
         return False, f"错误: {e}"
 
 
@@ -1116,12 +1031,56 @@ def check_delayed_signals():
             basic_trend = current_price_data['trend_analysis'].get('basic_trend', {})
             current_trend_direction = basic_trend.get('direction', '震荡整理')
             current_trend_stability = basic_trend.get('stability_score', 0)
+            current_price_vs_sma20_pct = basic_trend.get('price_vs_sma20_pct', 0)
+            long_term = current_price_data.get('long_term_analysis', {})
+            long_market_structure = long_term.get('market_structure', 'N/A')
+            long_bias = long_term.get('market_bias', '中性')
+            long_bias_strength = float(long_term.get('bias_strength', 0) or 0)
             
             signal_type = delayed_signal['signal']
+            confidence = delayed_signal.get('confidence', 'LOW')
             
             # 重新检查趋势确认条件
             confirmed = True
             reason = "趋势确认，执行延迟信号"
+
+            # A. 晚入场保护：距离EMA20过远（非高置信度信号）
+            if abs(current_price_vs_sma20_pct) > 2.0 and confidence != 'HIGH':
+                confirmed = False
+                reason = f"离20均线过远({current_price_vs_sma20_pct:+.2f}%)"
+
+            # B. 多周期一致性：1小时趋势需同向（非高置信度信号）
+            if confirmed:
+                try:
+                    df_1h = get_1h_ohlcv_data()
+                    if df_1h is not None and len(df_1h) >= 30:
+                        hour_trend = get_market_trend(df_1h)
+                        hour_dir = hour_trend.get('basic_trend', {}).get('direction', None)
+                        if signal_type == 'BUY' and hour_dir != '多头趋势' and confidence != 'HIGH':
+                            confirmed = False
+                            reason = f"1小时趋势非多头({hour_dir})"
+                        if signal_type == 'SELL' and hour_dir != '空头趋势' and confidence != 'HIGH':
+                            confirmed = False
+                            reason = f"1小时趋势非空头({hour_dir})"
+                except Exception:
+                    pass
+
+            # C. 长周期过滤：顶部/底部区域与市场偏向（非高置信度信号）
+            if confirmed:
+                if signal_type == 'BUY':
+                    if long_market_structure == '可能顶部区域':
+                        confirmed = False
+                        reason = "长周期提示可能顶部区域"
+                    elif long_bias == '偏空' and long_bias_strength >= 40 and confidence != 'HIGH':
+                        confirmed = False
+                        reason = f"长周期偏空(强度{long_bias_strength:.1f}%)"
+                elif signal_type == 'SELL':
+                    if long_market_structure == '可能底部区域':
+                        confirmed = False
+                        reason = "长周期提示可能底部区域"
+                    elif long_bias == '偏多' and long_bias_strength >= 40 and confidence != 'HIGH':
+                        confirmed = False
+                        reason = f"长周期偏多(强度{long_bias_strength:.1f}%)"
             
             # 1. 逆趋势信号需要趋势稳定性达到85%
             if (signal_type == 'BUY' and current_trend_direction == '空头趋势') or \
@@ -1363,6 +1322,7 @@ def calculate_technical_indicators(df):
         df['sma_200'] = df['close'].rolling(window=200, min_periods=1).mean()  # 添加200周期均线
 
         # 指数移动平均线
+        df['ema_20'] = df['close'].ewm(span=20).mean()
         df['ema_12'] = df['close'].ewm(span=12).mean()
         df['ema_26'] = df['close'].ewm(span=26).mean()
         df['macd'] = df['ema_12'] - df['ema_26']
@@ -1390,6 +1350,15 @@ def calculate_technical_indicators(df):
         # 支撑阻力位
         df['resistance'] = df['high'].rolling(20).max()
         df['support'] = df['low'].rolling(20).min()
+
+        # 📏 ATR（Average True Range）- 用于稳定的追踪止盈
+        # 使用Welles Wilder平滑的近似：EWMA(alpha=1/窗口)
+        prev_close = df['close'].shift(1)
+        tr1 = (df['high'] - df['low']).abs()
+        tr2 = (df['high'] - prev_close).abs()
+        tr3 = (df['low'] - prev_close).abs()
+        df['tr'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        df['atr'] = df['tr'].ewm(alpha=1/14, adjust=False).mean()
 
         # 填充NaN值
         df = df.bfill().ffill()
@@ -1508,7 +1477,7 @@ def get_market_trend(df):
         current_price = df['close'].iloc[-1]
 
         # 多时间框架趋势分析
-        trend_short = "上涨" if current_price > df['sma_20'].iloc[-1] else "下跌"
+        trend_short = "上涨" if current_price > df['ema_20'].iloc[-1] else "下跌"
         trend_medium = "上涨" if current_price > df['sma_50'].iloc[-1] else "下跌"
 
         # MACD趋势
@@ -1524,7 +1493,7 @@ def get_market_trend(df):
 
         # 🆕 基本趋势判断逻辑
         # 1. 均线上下判断
-        above_sma20 = current_price > df['sma_20'].iloc[-1]
+        above_sma20 = current_price > df['ema_20'].iloc[-1]
         above_sma50 = current_price > df['sma_50'].iloc[-1]
         
         # 2. 均线排列判断
@@ -1532,7 +1501,7 @@ def get_market_trend(df):
         sma_bearish_alignment = df['sma_5'].iloc[-1] < df['sma_20'].iloc[-1] < df['sma_50'].iloc[-1]
         
         # 3. 趋势强度判断
-        price_vs_sma20 = (current_price - df['sma_20'].iloc[-1]) / df['sma_20'].iloc[-1] * 100
+        price_vs_sma20 = (current_price - df['ema_20'].iloc[-1]) / df['ema_20'].iloc[-1] * 100
         price_vs_sma50 = (current_price - df['sma_50'].iloc[-1]) / df['sma_50'].iloc[-1] * 100
         
         # 4. 趋势确认机制 - 检查最近3根K线的趋势一致性
@@ -1540,8 +1509,8 @@ def get_market_trend(df):
         for i in range(1, 4):  # 检查最近3根K线
             if len(df) > i:
                 price_prev = df['close'].iloc[-i-1]
-                sma20_prev = df['sma_20'].iloc[-i-1]
-                if (current_price > df['sma_20'].iloc[-1]) == (price_prev > sma20_prev):
+                ema20_prev = df['ema_20'].iloc[-i-1]
+                if (current_price > df['ema_20'].iloc[-1]) == (price_prev > ema20_prev):
                     recent_trend_consistency += 1
         
         # 5. 趋势稳定性评分 (0-100)
@@ -1595,40 +1564,45 @@ def get_market_trend(df):
         return {}
 
 
-def analyze_long_term_trend(df):
-    """分析长期趋势（周线和月线级别）用于识别底部和顶部"""
+def analyze_4h_long_term_trend():
+    """分析4小时级别的长期趋势（周线和月线级别）用于识别底部和顶部"""
     try:
-        current_price = df['close'].iloc[-1]
+        # 获取4小时K线数据
+        df_4h = get_4h_ohlcv_data()
+        if df_4h is None or len(df_4h) < 50:
+            return {}
+        
+        current_price = df_4h['close'].iloc[-1]
         
         # 长期趋势分析 - 基于更长周期的移动平均线
-        weekly_trend = "上涨" if current_price > df['sma_50'].iloc[-1] else "下跌"
-        monthly_trend = "上涨" if current_price > df['sma_200'].iloc[-1] else "下跌"
+        weekly_trend = "上涨" if current_price > df_4h['sma_50'].iloc[-1] else "下跌"
+        monthly_trend = "上涨" if current_price > df_4h['sma_200'].iloc[-1] else "下跌"
         
         # 长期均线排列判断
-        long_term_bullish = df['sma_50'].iloc[-1] > df['sma_200'].iloc[-1]
-        long_term_bearish = df['sma_50'].iloc[-1] < df['sma_200'].iloc[-1]
+        long_term_bullish = df_4h['sma_50'].iloc[-1] > df_4h['sma_200'].iloc[-1]
+        long_term_bearish = df_4h['sma_50'].iloc[-1] < df_4h['sma_200'].iloc[-1]
         
         # 价格相对于长期均线的位置
-        price_vs_weekly = (current_price - df['sma_50'].iloc[-1]) / df['sma_50'].iloc[-1] * 100
-        price_vs_monthly = (current_price - df['sma_200'].iloc[-1]) / df['sma_200'].iloc[-1] * 100
+        price_vs_weekly = (current_price - df_4h['sma_50'].iloc[-1]) / df_4h['sma_50'].iloc[-1] * 100
+        price_vs_monthly = (current_price - df_4h['sma_200'].iloc[-1]) / df_4h['sma_200'].iloc[-1] * 100
         
         # 底部识别逻辑
         is_potential_bottom = False
         bottom_reasons = []
         
         # 1. 价格接近或低于长期支撑位
-        if current_price <= df['sma_200'].iloc[-1] * 1.05:  # 价格在月线支撑附近
+        if current_price <= df_4h['sma_200'].iloc[-1] * 1.05:  # 价格在月线支撑附近
             is_potential_bottom = True
             bottom_reasons.append("价格接近月线支撑")
         
         # 2. RSI超卖区域
-        if df['rsi'].iloc[-1] < 30:
+        if df_4h['rsi'].iloc[-1] < 30:
             is_potential_bottom = True
             bottom_reasons.append("RSI超卖")
         
         # 3. 成交量放大确认
-        volume_ratio = df['volume'].iloc[-1] / df['volume'].rolling(20).mean().iloc[-1]
-        if volume_ratio > 1.5 and current_price < df['close'].iloc[-2]:  # 放量下跌
+        volume_ratio = df_4h['volume'].iloc[-1] / df_4h['volume'].rolling(20).mean().iloc[-1]
+        if volume_ratio > 1.5 and current_price < df_4h['close'].iloc[-2]:  # 放量下跌
             is_potential_bottom = True
             bottom_reasons.append("放量下跌可能见底")
         
@@ -1637,17 +1611,17 @@ def analyze_long_term_trend(df):
         top_reasons = []
         
         # 1. 价格大幅高于长期均线
-        if current_price >= df['sma_200'].iloc[-1] * 1.20:  # 价格高于月线20%
+        if current_price >= df_4h['sma_200'].iloc[-1] * 1.20:  # 价格高于月线20%
             is_potential_top = True
             top_reasons.append("价格大幅偏离月线")
         
         # 2. RSI超买区域
-        if df['rsi'].iloc[-1] > 70:
+        if df_4h['rsi'].iloc[-1] > 70:
             is_potential_top = True
             top_reasons.append("RSI超买")
         
         # 3. 成交量异常放大
-        if volume_ratio > 2.0 and current_price > df['close'].iloc[-2]:  # 放量上涨
+        if volume_ratio > 2.0 and current_price > df_4h['close'].iloc[-2]:  # 放量上涨
             is_potential_top = True
             top_reasons.append("异常放量可能见顶")
         
@@ -1664,6 +1638,9 @@ def analyze_long_term_trend(df):
         else:
             market_structure = "震荡整理"
         
+        # 🆕 大时间段整体数据分析 - 偏空偏多判断
+        bias_analysis = analyze_market_bias(df_4h)
+        
         return {
             'weekly_trend': weekly_trend,
             'monthly_trend': monthly_trend,
@@ -1676,12 +1653,190 @@ def analyze_long_term_trend(df):
             'bottom_reasons': bottom_reasons,
             'top_reasons': top_reasons,
             'market_structure': market_structure,
-            'volume_ratio': volume_ratio
+            'volume_ratio': volume_ratio,
+            # 🆕 新增大时间段分析结果
+            'market_bias': bias_analysis.get('bias', '中性'),
+            'bias_strength': bias_analysis.get('strength', 0),
+            'bias_reasons': bias_analysis.get('reasons', []),
+            'trend_consistency': bias_analysis.get('trend_consistency', 0)
         }
         
     except Exception as e:
         log_error(f"长期趋势分析失败: {e}")
         return {}
+
+
+def analyze_market_bias(df):
+    """
+    大时间段整体数据分析 - 判断未来一段时间市场偏空偏多
+    结合历史数据进行前后对比分析，识别市场结构变化
+    """
+    try:
+        if len(df) < 100:  # 需要足够的数据进行历史分析
+            return {'bias': '中性', 'strength': 0, 'reasons': ['数据不足'], 'trend_consistency': 0}
+        
+        current_price = df['close'].iloc[-1]
+        bias_score = 0
+        reasons = []
+        
+        # 1. 价格相对于历史区间的分析
+        lookback_period = min(200, len(df))
+        historical_high = df['high'].tail(lookback_period).max()
+        historical_low = df['low'].tail(lookback_period).min()
+        historical_mid = (historical_high + historical_low) / 2
+        
+        # 价格在历史区间中的位置
+        price_position = (current_price - historical_low) / (historical_high - historical_low) * 100
+        
+        if price_position > 70:
+            bias_score -= 15
+            reasons.append(f"价格处于历史高位({price_position:.1f}%)")
+        elif price_position < 30:
+            bias_score += 15
+            reasons.append(f"价格处于历史低位({price_position:.1f}%)")
+        
+        # 2. 均线系统分析
+        # 短期均线 vs 长期均线
+        sma20_vs_sma50 = df['sma_20'].iloc[-1] > df['sma_50'].iloc[-1]
+        sma50_vs_sma200 = df['sma_50'].iloc[-1] > df['sma_200'].iloc[-1]
+        
+        if sma20_vs_sma50 and sma50_vs_sma200:
+            bias_score += 20  # 多头排列
+            reasons.append("均线多头排列")
+        elif not sma20_vs_sma50 and not sma50_vs_sma200:
+            bias_score -= 20  # 空头排列
+            reasons.append("均线空头排列")
+        
+        # 3. 趋势一致性分析
+        trend_consistency = 0
+        
+        # 检查最近20根K线的趋势一致性
+        recent_trend_direction = []
+        for i in range(1, 21):
+            if i < len(df):
+                price_change = df['close'].iloc[-i] - df['close'].iloc[-i-1] if i < len(df)-1 else 0
+                recent_trend_direction.append(1 if price_change > 0 else -1 if price_change < 0 else 0)
+        
+        if recent_trend_direction:
+            trend_consistency = sum(recent_trend_direction) / len(recent_trend_direction)
+            if abs(trend_consistency) > 0.3:
+                if trend_consistency > 0:
+                    bias_score += 10
+                    reasons.append("近期上涨趋势明确")
+                else:
+                    bias_score -= 10
+                    reasons.append("近期下跌趋势明确")
+        
+        # 4. 成交量分析
+        volume_ma20 = df['volume'].rolling(20).mean().iloc[-1]
+        current_volume = df['volume'].iloc[-1]
+        volume_ratio = current_volume / volume_ma20 if volume_ma20 > 0 else 1
+        
+        if volume_ratio > 1.5:
+            # 放量上涨或下跌
+            price_change_pct = (current_price - df['close'].iloc[-2]) / df['close'].iloc[-2] * 100
+            if price_change_pct > 1:
+                bias_score += 8
+                reasons.append("放量上涨，多头动能强劲")
+            elif price_change_pct < -1:
+                bias_score -= 8
+                reasons.append("放量下跌，空头动能强劲")
+        
+        # 5. RSI位置分析
+        rsi_value = df['rsi'].iloc[-1]
+        if rsi_value > 70:
+            bias_score -= 12
+            reasons.append(f"RSI超买({rsi_value:.1f})")
+        elif rsi_value < 30:
+            bias_score += 12
+            reasons.append(f"RSI超卖({rsi_value:.1f})")
+        
+        # 6. MACD信号分析
+        macd_histogram = df['macd_histogram'].iloc[-1]
+        if macd_histogram > 0:
+            bias_score += 8
+            reasons.append("MACD柱状图转正")
+        elif macd_histogram < 0:
+            bias_score -= 8
+            reasons.append("MACD柱状图转负")
+        
+        # 7. 支撑阻力分析
+        support_levels = df['close'].rolling(20).min().iloc[-1]
+        resistance_levels = df['close'].rolling(20).max().iloc[-1]
+        
+        distance_to_support = abs(current_price - support_levels) / current_price * 100
+        distance_to_resistance = abs(current_price - resistance_levels) / current_price * 100
+        
+        if distance_to_support < 2:
+            bias_score += 10
+            reasons.append("接近强支撑位")
+        elif distance_to_resistance < 2:
+            bias_score -= 10
+            reasons.append("接近强阻力位")
+        
+        # 综合判断
+        # 规范化偏向强度到0-100（基于各项最大权重总和近似为83）
+        max_score = 83.0
+        bias_strength = min(100.0, abs(bias_score) / max_score * 100.0)
+        
+        if bias_score > 20:
+            bias = "偏多"
+        elif bias_score < -20:
+            bias = "偏空"
+        else:
+            bias = "中性"
+        
+        # 如果没有明确理由，添加中性说明
+        if not reasons:
+            reasons.append("市场处于平衡状态")
+        
+        return {
+            'bias': bias,
+            'strength': bias_strength,
+            'reasons': reasons,
+            'trend_consistency': trend_consistency
+        }
+        
+    except Exception as e:
+        log_error(f"市场偏向分析失败: {e}")
+        return {'bias': '中性', 'strength': 0, 'reasons': ['分析错误'], 'trend_consistency': 0}
+
+
+def get_4h_ohlcv_data():
+    """获取4小时K线数据用于大趋势分析"""
+    try:
+        # 获取4小时K线数据 - 使用300根K线，提高长周期均线稳定性（约7.5周）
+        ohlcv = exchange.fetch_ohlcv(TRADE_CONFIG['symbol'], '4h', limit=300)
+        
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        
+        # 计算技术指标
+        df = calculate_technical_indicators(df)
+
+        return df
+        
+    except Exception as e:
+        log_error(f"获取4小时K线数据失败: {e}")
+        return None
+
+
+def get_1h_ohlcv_data():
+    """获取1小时K线数据用于中周期一致性过滤"""
+    try:
+        # 获取1小时K线数据 - 使用300根K线，确保SMA200可用
+        ohlcv = exchange.fetch_ohlcv(TRADE_CONFIG['symbol'], '1h', limit=300)
+
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+
+        # 计算技术指标
+        df = calculate_technical_indicators(df)
+
+        return df
+    except Exception as e:
+        log_error(f"获取1小时K线数据失败: {e}")
+        return None
 
 
 def get_btc_ohlcv_enhanced():
@@ -1703,7 +1858,7 @@ def get_btc_ohlcv_enhanced():
         # 获取技术分析数据
         trend_analysis = get_market_trend(df)
         levels_analysis = get_support_resistance_levels(df)
-        long_term_analysis = analyze_long_term_trend(df)
+        long_term_analysis = analyze_4h_long_term_trend()  # 使用4小时数据的大趋势分析
 
         return {
             'price': current_data['close'],
@@ -1717,6 +1872,7 @@ def get_btc_ohlcv_enhanced():
             'technical_data': {
                 'sma_5': current_data.get('sma_5', 0),
                 'sma_20': current_data.get('sma_20', 0),
+                'ema_20': current_data.get('ema_20', 0),
                 'sma_50': current_data.get('sma_50', 0),
                 'rsi': current_data.get('rsi', 0),
                 'macd': current_data.get('macd', 0),
@@ -1725,7 +1881,8 @@ def get_btc_ohlcv_enhanced():
                 'bb_upper': current_data.get('bb_upper', 0),
                 'bb_lower': current_data.get('bb_lower', 0),
                 'bb_position': current_data.get('bb_position', 0),
-                'volume_ratio': current_data.get('volume_ratio', 0)
+                'volume_ratio': current_data.get('volume_ratio', 0),
+                'ATR': current_data.get('ATR', 0)
             },
             'trend_analysis': trend_analysis,
             'levels_analysis': levels_analysis,
@@ -1759,7 +1916,7 @@ def generate_technical_analysis_text(price_data):
     【技术指标分析】
     📈 移动平均线:
     - 5周期: {safe_float(tech['sma_5']):.2f} | 价格相对: {(price_data['price'] - safe_float(tech['sma_5'])) / safe_float(tech['sma_5']) * 100:+.2f}%
-    - 20周期: {safe_float(tech['sma_20']):.2f} | 价格相对: {(price_data['price'] - safe_float(tech['sma_20'])) / safe_float(tech['sma_20']) * 100:+.2f}%
+    - 20周期EMA: {safe_float(tech.get('ema_20', 0)):.2f} | 价格相对: {(price_data['price'] - safe_float(tech.get('ema_20', 0))) / (safe_float(tech.get('ema_20', 0)) or 1) * 100:+.2f}%
     - 50周期: {safe_float(tech['sma_50']):.2f} | 价格相对: {(price_data['price'] - safe_float(tech['sma_50'])) / safe_float(tech['sma_50']) * 100:+.2f}%
 
     🎯 趋势分析:
@@ -1785,6 +1942,11 @@ def generate_technical_analysis_text(price_data):
     - 价格相对周线: {long_term.get('price_vs_weekly_pct', 0):+.2f}%
     - 价格相对月线: {long_term.get('price_vs_monthly_pct', 0):+.2f}%
     - 市场结构: {long_term.get('market_structure', 'N/A')}
+    
+    🎯 【大时间段整体分析 - 未来偏向判断】:
+    - 市场偏向: {long_term.get('market_bias', 'N/A')} (强度: {long_term.get('bias_strength', 0):.1f}%)
+    - 趋势一致性: {long_term.get('trend_consistency', 0):.2f}
+    - 分析理由: {', '.join(long_term.get('bias_reasons', ['暂无']))}
     - 成交量比率: {long_term.get('volume_ratio', 0):.2f}x
     
     🎯 【底部顶部识别】:
@@ -1795,6 +1957,7 @@ def generate_technical_analysis_text(price_data):
     - RSI: {safe_float(tech['rsi']):.2f} ({'超买' if safe_float(tech['rsi']) > 70 else '超卖' if safe_float(tech['rsi']) < 30 else '中性'})
     - MACD: {safe_float(tech['macd']):.4f}
     - 信号线: {safe_float(tech['macd_signal']):.4f}
+    - ATR(波动率): {safe_float(tech.get('ATR', 0)):.2f}
 
     🎚️ 布林带位置: {safe_float(tech['bb_position']):.2%} ({'上部' if safe_float(tech['bb_position']) > 0.7 else '下部' if safe_float(tech['bb_position']) < 0.3 else '中部'})
 
@@ -1879,8 +2042,6 @@ def create_fallback_signal(price_data):
     return {
         "signal": "HOLD",
         "reason": "因技术分析暂时不可用，采取保守策略",
-        "stop_loss": price_data['price'] * 0.98,  # -2%
-        "take_profit": price_data['price'] * 1.02,  # +2%
         "confidence": "LOW",
         "is_fallback": True
     }
@@ -1888,6 +2049,7 @@ def create_fallback_signal(price_data):
 
 def analyze_with_bailian(price_data):
     """使用阿里云百炼分析市场并生成交易信号（增强版）"""
+    global risk_state
 
     # 生成技术分析文本
     technical_analysis = generate_technical_analysis_text(price_data)
@@ -1920,7 +2082,7 @@ def analyze_with_bailian(price_data):
     pnl_text = f", 持仓盈亏: {current_pos['unrealized_pnl']:.2f} USDT" if current_pos else ""
 
     prompt = f"""
-    你是一个专业的加密货币交易分析师。请基于以下BTC/USDT {TRADE_CONFIG['timeframe']}周期数据进行分析：
+    你是一个专业的加密货币缠论分析师。擅长多时间周期分析和量化交易策略，专注于短线的高胜率机会。请基于以下BTC/USDT {TRADE_CONFIG['timeframe']}周期数据进行分析：
 
     {kline_text}
 
@@ -2013,9 +2175,17 @@ def analyze_with_bailian(price_data):
     {{
         "signal": "BUY|SELL|HOLD",
         "reason": "简要分析理由(包含趋势判断和技术依据)",
-        "stop_loss": 具体价格,
-        "take_profit": 具体价格, 
-        "confidence": "HIGH|MEDIUM|LOW"
+        "confidence": "HIGH|MEDIUM|LOW",
+        "risk_control": {{
+            "trailing_stop": {{
+                "atr_multiplier": 数值(可选),
+                "activation_ratio": 数值(可选),
+                "break_even_buffer_ratio": 数值(可选),
+                "min_step_ratio": 数值(可选),
+                "update_cooldown": 数值(秒, 可选),
+                "aggressiveness": "aggressive|balanced|conservative"(可选)
+            }}
+        }}
     }}
     """
 
@@ -2048,8 +2218,8 @@ def analyze_with_bailian(price_data):
         else:
             signal_data = create_fallback_signal(price_data)
 
-        # 验证必需字段
-        required_fields = ['signal', 'reason', 'stop_loss', 'take_profit', 'confidence']
+        # 验证必需字段（去除固定止盈止损，改为仅需核心字段）
+        required_fields = ['signal', 'reason', 'confidence']
         if not all(field in signal_data for field in required_fields):
             signal_data = create_fallback_signal(price_data)
 
@@ -2061,6 +2231,115 @@ def analyze_with_bailian(price_data):
         signal_history.append(signal_data)
         if len(signal_history) > 30:
             signal_history.pop(0)
+
+        # 🆕 融合AI建议的追踪止盈参数（若提供），否则依据置信度动态调整
+        try:
+            rc = signal_data.get('risk_control', {}) or {}
+            ts = rc.get('trailing_stop', {}) or {}
+
+            def sf(v, default=None):
+                try:
+                    return float(v)
+                except Exception:
+                    return default
+
+            dynamic_cfg = {}
+            # 参数范围钳制
+            def clamp(name, val):
+                bounds = {
+                    'atr_multiplier': (1.5, 5.0),
+                    'activation_ratio': (0.001, 0.02),
+                    'break_even_buffer_ratio': (0.0, 0.01),
+                    'min_step_ratio': (0.0005, 0.01),
+                    'update_cooldown': (30, 600)
+                }
+                if val is None:
+                    return None
+                lo, hi = bounds[name]
+                try:
+                    return max(lo, min(hi, val))
+                except Exception:
+                    return None
+
+            if ts:
+                dynamic_cfg = {
+                    'atr_multiplier': clamp('atr_multiplier', sf(ts.get('atr_multiplier'), None)),
+                    'activation_ratio': clamp('activation_ratio', sf(ts.get('activation_ratio'), None)),
+                    'break_even_buffer_ratio': clamp('break_even_buffer_ratio', sf(ts.get('break_even_buffer_ratio'), None)),
+                    'min_step_ratio': clamp('min_step_ratio', sf(ts.get('min_step_ratio'), None)),
+                    'update_cooldown': int(clamp('update_cooldown', sf(ts.get('update_cooldown'), None))) if ts.get('update_cooldown') is not None else None,
+                }
+                # 清理掉None，保留有效值
+                dynamic_cfg = {k: v for k, v in dynamic_cfg.items() if v is not None}
+
+                # 基于aggressiveness提供默认模板
+                aggr = (ts.get('aggressiveness') or '').lower()
+                templates = {
+                    'aggressive': {
+                        'atr_multiplier': 2.0,
+                        'activation_ratio': 0.003,
+                        'break_even_buffer_ratio': 0.0008,
+                        'min_step_ratio': 0.0015,
+                        'update_cooldown': 90,
+                    },
+                    'balanced': {
+                        'atr_multiplier': 2.5,
+                        'activation_ratio': 0.004,
+                        'break_even_buffer_ratio': 0.001,
+                        'min_step_ratio': 0.002,
+                        'update_cooldown': 120,
+                    },
+                    'conservative': {
+                        'atr_multiplier': 3.0,
+                        'activation_ratio': 0.005,
+                        'break_even_buffer_ratio': 0.0015,
+                        'min_step_ratio': 0.0025,
+                        'update_cooldown': 150,
+                    }
+                }
+                if aggr in templates:
+                    for k, v in templates[aggr].items():
+                        dynamic_cfg.setdefault(k, v)
+                # 最终再进行一次范围钳制
+                for k in list(dynamic_cfg.keys()):
+                    dynamic_cfg[k] = clamp(k, dynamic_cfg[k]) if k != 'update_cooldown' else int(clamp('update_cooldown', dynamic_cfg[k]))
+            else:
+                # 若未提供，依据AI置信度设置模板
+                conf = signal_data.get('confidence', 'MEDIUM')
+                mapping = {
+                    'HIGH': {
+                        'atr_multiplier': 3.0,
+                        'activation_ratio': 0.005,
+                        'break_even_buffer_ratio': 0.0015,
+                        'min_step_ratio': 0.0025,
+                        'update_cooldown': 150,
+                    },
+                    'MEDIUM': {
+                        'atr_multiplier': 2.5,
+                        'activation_ratio': 0.004,
+                        'break_even_buffer_ratio': 0.001,
+                        'min_step_ratio': 0.002,
+                        'update_cooldown': 120,
+                    },
+                    'LOW': {
+                        'atr_multiplier': 2.0,
+                        'activation_ratio': 0.003,
+                        'break_even_buffer_ratio': 0.0008,
+                        'min_step_ratio': 0.0015,
+                        'update_cooldown': 90,
+                    },
+                }
+                dynamic_cfg = mapping.get(conf, mapping['MEDIUM'])
+                # 范围钳制
+                for k in list(dynamic_cfg.keys()):
+                    dynamic_cfg[k] = clamp(k, dynamic_cfg[k]) if k != 'update_cooldown' else int(clamp('update_cooldown', dynamic_cfg[k]))
+
+            # 写入动态追踪参数供止盈函数使用
+            if isinstance(dynamic_cfg, dict) and dynamic_cfg:
+                risk_state['dynamic_trailing_cfg'] = dynamic_cfg
+                log_info(f"🧪 动态追踪参数: {dynamic_cfg}")
+        except Exception as e:
+            log_warning(f"动态追踪参数处理失败: {e}")
 
         # 信号统计
         signal_count = len([s for s in signal_history if s.get('signal') == signal_data['signal']])
@@ -2317,9 +2596,45 @@ def execute_intelligent_trade(signal_data, price_data):
         basic_trend = price_data['trend_analysis'].get('basic_trend', {})
         trend_direction = basic_trend.get('direction', '震荡整理')
         trend_stability = basic_trend.get('stability_score', 0)
+        price_vs_sma20_pct = basic_trend.get('price_vs_sma20_pct', 0)
+        long_term = price_data.get('long_term_analysis', {})
+        long_market_structure = long_term.get('market_structure', 'N/A')
+        long_bias = long_term.get('market_bias', '中性')
+        long_bias_strength = float(long_term.get('bias_strength', 0) or 0)
         
         signal_type = signal_data['signal']
         confidence = signal_data['confidence']
+
+        # 0. 晚入场保护：价格远离20EMA过多（±2%），降低非高置信度信号的执行
+        if abs(price_vs_sma20_pct) > 2.0 and confidence != 'HIGH':
+            return False, f"离20均线过远({price_vs_sma20_pct:+.2f}%)，等待回调"
+
+        # 0.1 多周期一致性：1小时趋势需同向（对非高置信度信号生效）
+        hour_trend_dir = None
+        try:
+            df_1h = get_1h_ohlcv_data()
+            if df_1h is not None and len(df_1h) >= 30:
+                hour_trend = get_market_trend(df_1h)
+                hour_trend_dir = hour_trend.get('basic_trend', {}).get('direction', None)
+        except Exception:
+            hour_trend_dir = None
+        if hour_trend_dir:
+            if signal_type == 'BUY' and hour_trend_dir != '多头趋势' and confidence != 'HIGH':
+                return False, f"1小时趋势非多头({hour_trend_dir})，延迟执行"
+            if signal_type == 'SELL' and hour_trend_dir != '空头趋势' and confidence != 'HIGH':
+                return False, f"1小时趋势非空头({hour_trend_dir})，延迟执行"
+
+        # 0.2 长周期过滤：顶部/底部区域与市场偏向（对非高置信度信号生效）
+        if signal_type == 'BUY':
+            if long_market_structure == '可能顶部区域':
+                return False, "长周期提示可能顶部区域，暂缓做多"
+            if long_bias == '偏空' and long_bias_strength >= 40 and confidence != 'HIGH':
+                return False, f"长周期偏空(强度{long_bias_strength:.1f}%)，延迟做多"
+        elif signal_type == 'SELL':
+            if long_market_structure == '可能底部区域':
+                return False, "长周期提示可能底部区域，暂缓做空"
+            if long_bias == '偏多' and long_bias_strength >= 40 and confidence != 'HIGH':
+                return False, f"长周期偏多(强度{long_bias_strength:.1f}%)，延迟做空"
         
         # 1. 逆趋势操作需要延迟执行（等待趋势确认）
         if (signal_type == 'BUY' and trend_direction == '空头趋势') or \
@@ -2720,17 +3035,11 @@ def trading_bot():
     # 3. 执行智能交易
     execute_intelligent_trade(signal_data, price_data)
 
-    # 🔒 可选：评估锁盈
+    # 🎯 统一：ATR稳定追踪止盈监控
     try:
-        evaluate_profit_lock(price_data['price'])
+        auto_stop_profit_loss(price_data)
     except Exception as e:
-        log_warning(f"锁盈评估异常: {e}")
-
-    # 🎯 自动止盈止损监控（新增）
-    try:
-        auto_stop_profit_loss(price_data['price'])
-    except Exception as e:
-        log_warning(f"止盈止损监控异常: {e}")
+        log_warning(f"追踪止盈监控异常: {e}")
 
     # 📨 结束本周期并发送汇总
     if TELEGRAM_ENABLED and TELEGRAM_BATCH_MODE:
