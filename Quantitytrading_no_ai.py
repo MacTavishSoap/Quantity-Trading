@@ -37,23 +37,37 @@ exchange_config = {
     'options': {
         'defaultType': 'swap',  # OKX使用swap表示永续合约
     },
-    'apiKey': os.getenv('OKX_API_KEY'),
-    'secret': os.getenv('OKX_SECRET'),
-    'password': os.getenv('OKX_PASSWORD'),
     'timeout': 30000,
     'enableRateLimit': True,
 }
 
+# 根据运行模式加载对应的 API Key
+if RUN_MODE == 'OKX_TESTNET':
+    exchange_config['apiKey'] = os.getenv('OKX_TESTNET_API_KEY')
+    exchange_config['secret'] = os.getenv('OKX_TESTNET_SECRET')
+    exchange_config['password'] = os.getenv('OKX_TESTNET_PASSWORD')
+    print("🔑 加载 OKX 模拟盘 (Testnet) API Key")
+else:
+    # LOCAL_SIMULATION (也可能需要行情数据) 或 REAL_TRADING
+    exchange_config['apiKey'] = os.getenv('OKX_REAL_API_KEY')
+    exchange_config['secret'] = os.getenv('OKX_REAL_SECRET')
+    exchange_config['password'] = os.getenv('OKX_REAL_PASSWORD')
+    if RUN_MODE == 'REAL_TRADING':
+        print("🔑 加载 OKX 实盘 (Real) API Key")
+    else:
+        print("🔑 加载 OKX 实盘 Key 用于本地模拟行情获取")
+
 # 代理配置
-USE_PROXY = False # 强制关闭代理，使用直连模式
-# if os.getenv('USE_PROXY', 'false').lower() == 'true':
-#     exchange_config['proxies'] = {
-#         'http': 'http://127.0.0.1:7890',
-#         'https': 'http://127.0.0.1:7890',
-#     }
-#     print("🌐 使用本地代理: http://127.0.0.1:7890")
-# else:
-print("🌐 直连模式 (无代理)")
+# 优先尝试本地常用代理端口
+USE_PROXY = True 
+if USE_PROXY:
+    exchange_config['proxies'] = {
+        'http': 'http://127.0.0.1:7890',
+        'https': 'http://127.0.0.1:7890',
+    }
+    print("🌐 使用本地代理: http://127.0.0.1:7890")
+else:
+    print("🌐 直连模式 (无代理)")
 
 # WebSocket 配置
 USE_WEBSOCKET = True  # 启用 WebSocket 获取实时订单流数据
@@ -84,6 +98,10 @@ TRADE_CONFIG = {
     'trailing_activation': 0.008,    # 盈利达到 0.8% 激活追踪 (BTC: 0.5%)
     'trailing_callback': 0.004,      # 最高点回撤 0.4% 止盈 (BTC: 0.3%)
     
+    # 趋势分析参数
+    'trend_timeframe': '4h',         # 趋势判断周期
+    'trend_ema_period': 50,          # 趋势EMA周期
+
     'position_size_usdt': 1000, # 每次交易名义价值 (USDT)
 }
 
@@ -572,7 +590,14 @@ def run_strategy_loop():
     # 初始化订单流管理器
     print(f"🌊 初始化订单流管理器 (WebSocket: {USE_WEBSOCKET})...")
     is_sandbox = (RUN_MODE == 'OKX_TESTNET')
-    of_manager = OrderFlowManager(exchange, TRADE_CONFIG['symbol'], use_ws=USE_WEBSOCKET, is_sandbox=is_sandbox)
+    of_manager = OrderFlowManager(
+        exchange, 
+        TRADE_CONFIG['symbol'], 
+        use_ws=USE_WEBSOCKET, 
+        is_sandbox=is_sandbox,
+        proxy_host='127.0.0.1' if USE_PROXY else None,
+        proxy_port=7890 if USE_PROXY else None
+    )
     
     # 等待 WebSocket 数据预热
     if USE_WEBSOCKET:

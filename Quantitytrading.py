@@ -39,9 +39,9 @@ exchange = ccxt.okx({
     'options': {
         'defaultType': 'swap',  # OKX使用swap表示永续合约
     },
-    'apiKey': os.getenv('OKX_API_KEY'),
-    'secret': os.getenv('OKX_SECRET'),
-    'password': os.getenv('OKX_PASSWORD'),  # OKX需要交易密码
+    'apiKey': os.getenv('OKX_REAL_API_KEY'),
+    'secret': os.getenv('OKX_REAL_SECRET'),
+    'password': os.getenv('OKX_REAL_PASSWORD'),  # OKX需要交易密码
 })
 
 # 交易参数配置 - 结合两个版本的优点
