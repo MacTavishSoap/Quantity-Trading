@@ -14,8 +14,10 @@ load_dotenv()
 # 1. 配置区域
 # ==========================================
 
-# 运行模式配置
-DRY_RUN = True  # 模拟盘模式 (True: 不发送真实订单, False: 实盘)
+# 运行模式配置# 运行模式配置
+# 可选值: 'LOCAL_SIMULATION' (本地模拟), 'OKX_TESTNET' (OKX模拟盘), 'REAL_TRADING' (实盘)
+RUN_MODE = 'OKX_TESTNET' 
+DRY_RUN = (RUN_MODE == 'LOCAL_SIMULATION')
 
 # Telegram配置
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN') or os.getenv('TELEGRAM_BOT_TOKEN')
@@ -58,6 +60,9 @@ USE_WEBSOCKET = True  # 启用 WebSocket 获取实时订单流数据
 
 # 初始化交易所实例
 exchange = ccxt.okx(exchange_config)
+if RUN_MODE == 'OKX_TESTNET':
+    exchange.set_sandbox_mode(True)
+    print("🧪 已启用 OKX 模拟盘模式 (Sandbox)")
 # 强制禁用 fetchCurrencies 以免触发私有接口鉴权错误 (Common issue with OKX V5 API keys)
 exchange.has['fetchCurrencies'] = False
 
@@ -181,6 +186,88 @@ class VirtualAccount:
 virtual_account = VirtualAccount()
 
 # ==========================================
+# 3.b 实盘/Testnet 交易辅助函数
+# ==========================================
+
+def get_exchange_position():
+    """获取交易所真实持仓 (用于 OKX_TESTNET 或 REAL_TRADING)"""
+    try:
+        positions = exchange.fetch_positions([TRADE_CONFIG['symbol']])
+        if positions:
+            # 过滤出持仓量大于0的
+            active_pos = [p for p in positions if float(p['contracts']) > 0]
+            if active_pos:
+                pos = active_pos[0]
+                return {
+                    'side': pos['side'], # long or short
+                    'entry_price': float(pos['entryPrice']),
+                    'contracts': float(pos['contracts']),
+                    'unrealized_pnl': float(pos['unrealizedPnl']),
+                    'entry_time': datetime.fromtimestamp(int(pos['updatedTime'])/1000).strftime('%H:%M:%S')
+                }
+        return None
+    except Exception as e:
+        print(f"⚠️ 获取持仓失败: {e}")
+        return None
+
+def execute_exchange_order(side, price, size_usdt):
+    """执行交易所订单"""
+    try:
+        # 计算张数
+        contract_size = TRADE_CONFIG['contract_size']
+        if contract_size <= 0: contract_size = 0.01 # 防止除零
+        
+        size_coin = size_usdt / price
+        num_contracts = int(size_coin / contract_size)
+        
+        if num_contracts < 1:
+            log_and_notify(f"⚠️ 下单数量不足 1 张 ({size_coin:.4f} < {contract_size})，忽略")
+            return False
+            
+        print(f"📤 [API] 发送订单: {side.upper()} {num_contracts} 张 @ 市价")
+        
+        # 市价单
+        # 开多: buy, 开空: sell
+        order_side = 'buy' if side == 'long' else 'sell'
+        
+        order = exchange.create_order(
+            symbol=TRADE_CONFIG['symbol'],
+            type='market',
+            side=order_side,
+            amount=num_contracts,
+            params={'tdMode': 'cross'}
+        )
+        log_and_notify(f"✅ 订单成功: {order['id']}")
+        return True
+    except Exception as e:
+        log_and_notify(f"❌ 下单失败: {e}")
+        return False
+
+def close_exchange_position(position_info):
+    """平仓"""
+    try:
+        side = position_info['side'] # long or short
+        contracts = int(position_info['contracts'])
+        
+        # 平多: sell, 平空: buy
+        close_side = 'sell' if side == 'long' else 'buy'
+        
+        print(f"📤 [API] 发送平仓订单: {close_side.upper()} {contracts} 张")
+        
+        order = exchange.create_order(
+            symbol=TRADE_CONFIG['symbol'],
+            type='market',
+            side=close_side,
+            amount=contracts,
+            params={'tdMode': 'cross', 'reduceOnly': True}
+        )
+        log_and_notify(f"✅ 平仓成功: {order['id']}")
+        return True
+    except Exception as e:
+        log_and_notify(f"❌ 平仓失败: {e}")
+        return False
+
+# ==========================================
 # 3. 核心功能函数
 # ==========================================
 
@@ -194,6 +281,11 @@ def setup_exchange():
         try:
             markets_list = exchange.fetch_markets({'instType': 'SWAP'})
             # 手动构建 market 字典供后续使用
+            if exchange.markets is None:
+                exchange.markets = {}
+            if exchange.ids is None:
+                exchange.ids = {}
+                
             for m in markets_list:
                 exchange.markets[m['symbol']] = m
                 exchange.ids[m['id']] = m['symbol']
@@ -213,17 +305,20 @@ def setup_exchange():
             TRADE_CONFIG['contract_size'] = 0.01 if 'BTC' in TRADE_CONFIG['symbol'] else 0.1
             TRADE_CONFIG['min_amount'] = 1
 
-        if not DRY_RUN:
-            # 实盘才进行的设置
-            print("⚙️ [实盘] 设置全仓模式和杠杆...")
-            exchange.set_leverage(TRADE_CONFIG['leverage'], TRADE_CONFIG['symbol'], {'mgnMode': 'cross'})
+        if RUN_MODE in ['OKX_TESTNET', 'REAL_TRADING']:
+            # 实盘/Testnet 才进行的设置
+            print(f"⚙️ [{RUN_MODE}] 设置全仓模式和杠杆...")
+            try:
+                exchange.set_leverage(TRADE_CONFIG['leverage'], TRADE_CONFIG['symbol'], {'mgnMode': 'cross'})
+            except Exception as e:
+                print(f"⚠️ 设置杠杆失败 (可能是已设置): {e}")
         
         return True
     except Exception as e:
         print(f"❌ 交易所设置失败: {e}")
-        # 模拟盘允许失败继续 (使用默认值)
-        if DRY_RUN:
-             print("⚠️ 模拟盘模式：忽略设置错误，使用默认参数继续...")
+        # 本地模拟盘允许失败继续 (使用默认值)
+        if RUN_MODE == 'LOCAL_SIMULATION':
+             print("⚠️ 本地模拟模式：忽略设置错误，使用默认参数继续...")
              if 'contract_size' not in TRADE_CONFIG: 
                  TRADE_CONFIG['contract_size'] = 0.01 if 'BTC' in TRADE_CONFIG['symbol'] else 0.1
              return True
@@ -274,16 +369,39 @@ def get_btc_ohlcv_enhanced():
         print(f"❌ 获取K线失败: {e}")
         return None
 
+def get_trend_data():
+    """获取大周期趋势数据 (全局战略视角)"""
+    try:
+        # 获取大周期K线
+        ohlcv = exchange.fetch_ohlcv(TRADE_CONFIG['symbol'], TRADE_CONFIG['trend_timeframe'], limit=TRADE_CONFIG['trend_ema_period'] + 10)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        
+        # 计算EMA趋势线
+        df['ema_trend'] = df['close'].ewm(span=TRADE_CONFIG['trend_ema_period'], adjust=False).mean()
+        
+        current = df.iloc[-1]
+        trend = 'bullish' if current['close'] > current['ema_trend'] else 'bearish'
+        
+        return {
+            'trend': trend,
+            'ema': current['ema_trend'],
+            'price': current['close']
+        }
+    except Exception as e:
+        print(f"⚠️ 获取趋势数据失败: {e}")
+        return {'trend': 'neutral', 'ema': 0, 'price': 0}
+
 # ==========================================
 # 4. 策略逻辑
 # ==========================================
 
-def analyze_market(price_data, order_flow_metrics):
+def analyze_market(price_data, order_flow_metrics, trend_data):
     """
-    综合分析市场
+    综合分析市场 (结合多周期)
     策略逻辑:
-    1. 技术面: RSI不过热 + MACD趋势
-    2. 资金面: 订单流Delta方向确认 + 盘口失衡确认
+    1. 全局趋势: 4H EMA判断大方向 (顺势而为)
+    2. 技术面: 15m RSI + MACD 寻找入场点
+    3. 资金面: 订单流Delta + 盘口失衡 确认突破
     """
     signal = 'hold'
     reason = []
@@ -295,91 +413,144 @@ def analyze_market(price_data, order_flow_metrics):
     delta = order_flow_metrics.get('delta_1m', 0)
     imbalance = order_flow_metrics.get('imbalance', 0)
     
+    trend = trend_data['trend']
+    
     # 阈值
     rsi_high = TRADE_CONFIG['rsi_overbought']
     rsi_low = TRADE_CONFIG['rsi_oversold']
 
     # --- 做多逻辑 ---
-    # 技术面: RSI < 70 (未超买) 且 MACD > Signal (金叉状态)
-    tech_long = rsi < rsi_high and macd > macd_signal
-    # 资金面: 1分钟主动买入更多 (Delta > 0) 且 盘口买单厚 (Imbalance > 0)
-    flow_long = delta > 0 and imbalance > 0.1 # 0.1 表示买盘比卖盘多10%以上
-    
-    if tech_long and flow_long:
-        signal = 'buy'
-        reason.append(f"RSI({rsi:.1f})健康")
-        reason.append("MACD看涨")
-        reason.append(f"资金流Delta({delta:.2f})为正")
+    # 1. 大趋势看涨
+    # 2. 技术面: RSI < 70 且 MACD 金叉
+    # 3. 资金面: 主动买入 (Delta > 0)
+    if trend == 'bullish':
+        tech_long = rsi < rsi_high and macd > macd_signal
+        flow_long = delta > 0 and imbalance > 0.1
+        
+        if tech_long and flow_long:
+            signal = 'buy'
+            reason.append(f"大趋势看涨(>EMA{TRADE_CONFIG['trend_ema_period']})")
+            reason.append(f"RSI({rsi:.1f})健康")
+            reason.append("MACD金叉")
+            reason.append(f"资金流配合(Delta:{delta:.0f})")
 
     # --- 做空逻辑 ---
-    # 技术面: RSI > 30 (未超卖) 且 MACD < Signal (死叉状态)
-    tech_short = rsi > rsi_low and macd < macd_signal
-    # 资金面: 1分钟主动卖出更多 (Delta < 0) 且 盘口卖单厚 (Imbalance < -0.1)
-    flow_short = delta < 0 and imbalance < -0.1
-    
-    if tech_short and flow_short:
-        signal = 'sell'
-        reason.append(f"RSI({rsi:.1f})健康")
-        reason.append("MACD看跌")
-        reason.append(f"资金流Delta({delta:.2f})为负")
+    # 1. 大趋势看跌
+    # 2. 技术面: RSI > 30 且 MACD 死叉
+    # 3. 资金面: 主动卖出 (Delta < 0)
+    elif trend == 'bearish':
+        tech_short = rsi > rsi_low and macd < macd_signal
+        flow_short = delta < 0 and imbalance < -0.1
+        
+        if tech_short and flow_short:
+            signal = 'sell'
+            reason.append(f"大趋势看跌(<EMA{TRADE_CONFIG['trend_ema_period']})")
+            reason.append(f"RSI({rsi:.1f})健康")
+            reason.append("MACD死叉")
+            reason.append(f"资金流配合(Delta:{delta:.0f})")
 
     return signal, ", ".join(reason)
 
+# 实盘/Testnet 状态追踪器 (用于记录最高/最低价以实现追踪止盈)
+REAL_POS_TRACKER = {
+    'highest_price': 0,
+    'lowest_price': 0,
+    'trailing_active': False
+}
+
 def check_risk_management(current_price, timestamp):
     """检查持仓风险 (动态追踪止盈 + 固定止损)"""
-    if DRY_RUN:
+    
+    # 1. 获取持仓信息
+    if RUN_MODE == 'LOCAL_SIMULATION':
         pos = virtual_account.position
-        if not pos: return False
+    else:
+        # 实盘/Testnet: 从交易所获取 + 本地追踪最高/最低价
+        exch_pos = get_exchange_position()
+        if not exch_pos:
+            # 如果没持仓，重置追踪器
+            REAL_POS_TRACKER['highest_price'] = 0
+            REAL_POS_TRACKER['lowest_price'] = 0
+            REAL_POS_TRACKER['trailing_active'] = False
+            return False
+            
+        # 构造兼容的 pos 对象
+        pos = exch_pos.copy()
         
-        entry = pos['entry_price']
-        side = pos['side']
-        
-        # 1. 更新最高/最低价
+        # 初始化/更新追踪器
+        if pos['side'] == 'long':
+            if REAL_POS_TRACKER['highest_price'] == 0: REAL_POS_TRACKER['highest_price'] = pos['entry_price']
+            if current_price > REAL_POS_TRACKER['highest_price']: REAL_POS_TRACKER['highest_price'] = current_price
+            pos['highest_price'] = REAL_POS_TRACKER['highest_price']
+        else:
+            if REAL_POS_TRACKER['lowest_price'] == 0: REAL_POS_TRACKER['lowest_price'] = pos['entry_price']
+            if current_price < REAL_POS_TRACKER['lowest_price']: REAL_POS_TRACKER['lowest_price'] = current_price
+            pos['lowest_price'] = REAL_POS_TRACKER['lowest_price']
+            
+        pos['trailing_active'] = REAL_POS_TRACKER['trailing_active']
+
+    if not pos: return False
+    
+    entry = pos['entry_price']
+    side = pos['side']
+    
+    # 2. 更新最高/最低价 (本地模拟盘已经在 VirtualAccount 中更新，但为了统一逻辑再检查一遍也无妨)
+    if RUN_MODE == 'LOCAL_SIMULATION':
         if side == 'long':
-            if current_price > pos['highest_price']:
-                pos['highest_price'] = current_price
-            
-            # 计算当前浮动盈亏比例
+            if current_price > pos['highest_price']: pos['highest_price'] = current_price
             pnl_pct = (current_price - entry) / entry
-            
-        else: # short
-            if current_price < pos['lowest_price']:
-                pos['lowest_price'] = current_price
-                
-            # 计算当前浮动盈亏比例
+        else:
+            if current_price < pos['lowest_price']: pos['lowest_price'] = current_price
+            pnl_pct = (entry - current_price) / entry
+    else:
+        # 实盘 PnL 计算
+        if side == 'long':
+            pnl_pct = (current_price - entry) / entry
+        else:
             pnl_pct = (entry - current_price) / entry
 
-        # 2. 检查固定止损
-        if pnl_pct <= -TRADE_CONFIG['stop_loss_pct']:
-            virtual_account.close_position(current_price, "固定止损触发", timestamp)
-            return True
+    # 3. 检查固定止损
+    if pnl_pct <= -TRADE_CONFIG['stop_loss_pct']:
+        reason = "固定止损触发"
+        if RUN_MODE == 'LOCAL_SIMULATION':
+            virtual_account.close_position(current_price, reason, timestamp)
+        else:
+            close_exchange_position(pos)
+        return True
 
-        # 3. 动态追踪止盈逻辑
-        # 激活条件: 盈利超过 trailing_activation
-        if not pos['trailing_active']:
-            if pnl_pct >= TRADE_CONFIG['trailing_activation']:
-                pos['trailing_active'] = True
-                print(f"🎯 [追踪激活] 当前盈利 {pnl_pct*100:.2f}% >= {TRADE_CONFIG['trailing_activation']*100}%")
+    # 4. 动态追踪止盈逻辑
+    # 激活条件: 盈利超过 trailing_activation
+    if not pos['trailing_active']:
+        if pnl_pct >= TRADE_CONFIG['trailing_activation']:
+            pos['trailing_active'] = True
+            if RUN_MODE != 'LOCAL_SIMULATION': REAL_POS_TRACKER['trailing_active'] = True
+            print(f"🎯 [追踪激活] 当前盈利 {pnl_pct*100:.2f}% >= {TRADE_CONFIG['trailing_activation']*100}%")
+    
+    # 执行追踪: 如果已激活
+    if pos['trailing_active']:
+        callback_rate = TRADE_CONFIG['trailing_callback']
         
-        # 执行追踪: 如果已激活
-        if pos['trailing_active']:
-            callback_rate = TRADE_CONFIG['trailing_callback']
-            
-            if side == 'long':
-                # 触发价 = 最高价 * (1 - 回撤比例)
-                trigger_price = pos['highest_price'] * (1 - callback_rate)
-                if current_price <= trigger_price:
-                    reason = f"追踪止盈触发 (最高:{pos['highest_price']:.1f}, 回撤:{callback_rate*100}%)"
+        if side == 'long':
+            # 触发价 = 最高价 * (1 - 回撤比例)
+            trigger_price = pos['highest_price'] * (1 - callback_rate)
+            if current_price <= trigger_price:
+                reason = f"追踪止盈触发 (最高:{pos['highest_price']:.1f}, 回撤:{callback_rate*100}%)"
+                if RUN_MODE == 'LOCAL_SIMULATION':
                     virtual_account.close_position(current_price, reason, timestamp)
-                    return True
-            else: # short
-                # 触发价 = 最低价 * (1 + 回撤比例)
-                trigger_price = pos['lowest_price'] * (1 + callback_rate)
-                if current_price >= trigger_price:
-                    reason = f"追踪止盈触发 (最低:{pos['lowest_price']:.1f}, 回撤:{callback_rate*100}%)"
+                else:
+                    close_exchange_position(pos)
+                return True
+        else: # short
+            # 触发价 = 最低价 * (1 + 回撤比例)
+            trigger_price = pos['lowest_price'] * (1 + callback_rate)
+            if current_price >= trigger_price:
+                reason = f"追踪止盈触发 (最低:{pos['lowest_price']:.1f}, 回撤:{callback_rate*100}%)"
+                if RUN_MODE == 'LOCAL_SIMULATION':
                     virtual_account.close_position(current_price, reason, timestamp)
-                    return True
-            
+                else:
+                    close_exchange_position(pos)
+                return True
+        
     return False
 
 # ==========================================
@@ -388,23 +559,27 @@ def check_risk_management(current_price, timestamp):
 
 def run_strategy_loop():
     print("🚀 启动策略引擎...")
-    if DRY_RUN:
-        print("🧪 当前模式: 模拟盘 (Dry Run)")
+    if RUN_MODE == 'LOCAL_SIMULATION':
+        print("🧪 当前模式: 本地模拟盘 (Local Simulation)")
         print(f"💰 初始模拟资金: {virtual_account.balance} U")
+    elif RUN_MODE == 'OKX_TESTNET':
+        print("🧪 当前模式: OKX 模拟盘 (Testnet/Sandbox)")
+        print("⚠️ 请确保 .env 中配置了 Testnet API Key")
     else:
         print("⚠️⚠️⚠️ 当前模式: 实盘交易 (Real Trading) ⚠️⚠️⚠️")
         print("请确保您已充分了解风险！")
 
     # 初始化订单流管理器
     print(f"🌊 初始化订单流管理器 (WebSocket: {USE_WEBSOCKET})...")
-    of_manager = OrderFlowManager(exchange, TRADE_CONFIG['symbol'], use_ws=USE_WEBSOCKET)
+    is_sandbox = (RUN_MODE == 'OKX_TESTNET')
+    of_manager = OrderFlowManager(exchange, TRADE_CONFIG['symbol'], use_ws=USE_WEBSOCKET, is_sandbox=is_sandbox)
     
     # 等待 WebSocket 数据预热
     if USE_WEBSOCKET:
         print("⏳ 等待 WebSocket 数据预热 (5秒)...")
         time.sleep(5)
     
-    log_and_notify(f"🤖 策略已启动\n交易对: {TRADE_CONFIG['symbol']}\n模式: {'模拟盘' if DRY_RUN else '实盘'}\n数据源: {'WebSocket' if USE_WEBSOCKET else 'REST API'}")
+    log_and_notify(f"🤖 策略已启动\n交易对: {TRADE_CONFIG['symbol']}\n模式: {RUN_MODE}\n数据源: {'WebSocket' if USE_WEBSOCKET else 'REST API'}")
 
     while True:
         try:
@@ -412,6 +587,8 @@ def run_strategy_loop():
             
             # 1. 获取数据
             price_data = get_btc_ohlcv_enhanced()
+            trend_data = get_trend_data() # 获取大周期趋势
+            
             if not price_data:
                 time.sleep(10)
                 continue
@@ -424,8 +601,9 @@ def run_strategy_loop():
             # 2. 打印状态 (每分钟一次，或者有信号时)
             rsi = price_data['technical']['rsi']
             delta = of_metrics.get('delta_1m', 0)
+            trend_str = f"{trend_data['trend'].upper()} (EMA:{trend_data['ema']:.1f})"
             
-            print(f"[{timestamp}] 价格:{current_price:.1f} | RSI:{rsi:.1f} | Delta:{delta:.2f}")
+            print(f"[{timestamp}] 价格:{current_price:.1f} | 趋势:{trend_str} | RSI:{rsi:.1f} | Delta:{delta:.2f}")
 
             # 3. 风险管理 (检查现有持仓)
             if check_risk_management(current_price, timestamp):
@@ -433,18 +611,33 @@ def run_strategy_loop():
                 pass
             
             # 4. 信号分析 (如果没持仓)
-            elif (DRY_RUN and not virtual_account.position) or (not DRY_RUN and False): # 实盘持仓检查暂略
-                signal, reason = analyze_market(price_data, of_metrics)
+            else:
+                # 检查是否有持仓
+                has_position = False
+                if RUN_MODE == 'LOCAL_SIMULATION':
+                    has_position = (virtual_account.position is not None)
+                else:
+                    has_position = (get_exchange_position() is not None)
+
+                if has_position:
+                    signal = 'hold'
+                    reason = []
+                else:
+                    signal, reason = analyze_market(price_data, of_metrics, trend_data)
                 
                 if signal == 'buy':
                     log_and_notify(f"� [买入信号] {reason} @ {current_price:.1f}")
-                    if DRY_RUN:
+                    if RUN_MODE == 'LOCAL_SIMULATION':
                         virtual_account.open_position('long', current_price, TRADE_CONFIG['position_size_usdt'], timestamp)
+                    else:
+                        execute_exchange_order('long', current_price, TRADE_CONFIG['position_size_usdt'])
                 
                 elif signal == 'sell':
                     log_and_notify(f"🔴 [卖出信号] {reason} @ {current_price:.1f}")
-                    if DRY_RUN:
+                    if RUN_MODE == 'LOCAL_SIMULATION':
                         virtual_account.open_position('short', current_price, TRADE_CONFIG['position_size_usdt'], timestamp)
+                    else:
+                        execute_exchange_order('short', current_price, TRADE_CONFIG['position_size_usdt'])
 
         except KeyboardInterrupt:
             print("\n� 用户停止程序")

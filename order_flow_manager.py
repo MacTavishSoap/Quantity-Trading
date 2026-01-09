@@ -10,9 +10,10 @@ except Exception:
     websocket = None
 
 class OrderFlowManager:
-    def __init__(self, exchange, symbol, use_ws=True):
+    def __init__(self, exchange, symbol, use_ws=True, proxy_host=None, proxy_port=None, is_sandbox=False):
         self.exchange = exchange
         self.symbol = symbol
+        self.is_sandbox = is_sandbox
         try:
             self.market_id = self.exchange.market(self.symbol)['id']
         except Exception:
@@ -32,8 +33,14 @@ class OrderFlowManager:
         self.ws = None
         self.ws_thread = None
         self.ws_running = False
-        self.proxy_host = "127.0.0.1" if (os.getenv("USE_PROXY", "true").lower() == "true") else None
-        self.proxy_port = 7890 if self.proxy_host else None
+        
+        # 优先使用传入的代理，否则检查环境变量，默认关闭
+        if proxy_host:
+            self.proxy_host = proxy_host
+            self.proxy_port = proxy_port
+        else:
+            self.proxy_host = "127.0.0.1" if (os.getenv("USE_PROXY", "false").lower() == "true") else None
+            self.proxy_port = 7890 if self.proxy_host else None
         
         self.current_metrics = {
             'delta_1m': 0.0,      # 1分钟主动买卖差
@@ -201,7 +208,14 @@ class OrderFlowManager:
     def start_ws(self):
         if self.ws_running or websocket is None or not self.market_id:
             return
-        url = "wss://ws.okx.com:8443/ws/v5/public"
+        
+        if self.is_sandbox:
+            url = "wss://wspap.okx.com:8443/ws/v5/public?brokerId=9999"
+            print("🌐 使用模拟盘 WebSocket 地址")
+        else:
+            url = "wss://ws.okx.com:8443/ws/v5/public"
+            print("🌐 使用实盘 WebSocket 地址")
+
         def on_open(ws):
             print("🌐 WebSocket 连接已建立")
             sub = {
