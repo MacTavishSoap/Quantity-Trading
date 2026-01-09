@@ -59,7 +59,7 @@ else:
 
 # 代理配置
 # 优先尝试本地常用代理端口
-USE_PROXY = True 
+USE_PROXY = False
 if USE_PROXY:
     exchange_config['proxies'] = {
         'http': 'http://127.0.0.1:7890',
