@@ -1,6 +1,6 @@
 ccxt
-openai
 pandas
 python-dotenv
 requests
 urllib3
+websocket-client
