@@ -98,6 +98,16 @@ TRADE_CONFIG = {
     'trailing_activation': 0.008,    # 盈利达到 0.8% 激活追踪 (BTC: 0.5%)
     'trailing_callback': 0.004,      # 最高点回撤 0.4% 止盈 (BTC: 0.3%)
     
+    # 信号置信度参数
+    'confidence_threshold': 75,      # 开单所需最低置信度分数 (0-100)
+    'weights': {
+        'trend': 30,         # 趋势权重 (大方向)
+        'delta': 25,         # 资金流权重 (短期爆发)
+        'imbalance': 15,     # 盘口权重 (支撑/阻力)
+        'macd': 15,          # 动能权重
+        'rsi': 15            # 震荡指标权重
+    },
+    
     # 趋势分析参数
     'trend_timeframe': '4h',         # 趋势判断周期
     'trend_ema_period': 50,          # 趋势EMA周期
@@ -324,6 +334,21 @@ def setup_exchange():
             TRADE_CONFIG['min_amount'] = 1
 
         if RUN_MODE in ['OKX_TESTNET', 'REAL_TRADING']:
+            # 检查账户模式
+            try:
+                acc_config = exchange.private_get_account_config()
+                if acc_config and 'data' in acc_config and len(acc_config['data']) > 0:
+                    acct_lv = acc_config['data'][0]['acctLv']
+                    # acctLv: 1: Simple, 2: Single-currency margin, 3: Multi-currency margin, 4: Portfolio
+                    if str(acct_lv) == '1':
+                        print("\n❌❌❌ 严重错误: 账户模式为 '简单模式' (Simple Mode) ❌❌❌")
+                        print("此模式不支持合约交易/杠杆交易。")
+                        print("请务必前往 OKX 网页端或 App 修改账户设置为 '单币种保证金' (Single-currency margin) 或更高模式。")
+                        print("操作路径: 交易设置 -> 账户模式 -> 单币种保证金模式")
+                        print("程序将继续尝试运行，但下单可能会失败。\n")
+            except Exception as e:
+                print(f"⚠️ 无法获取账户配置信息: {e}")
+
             # 实盘/Testnet 才进行的设置
             print(f"⚙️ [{RUN_MODE}] 设置全仓模式和杠杆...")
             try:
@@ -415,59 +440,107 @@ def get_trend_data():
 
 def analyze_market(price_data, order_flow_metrics, trend_data):
     """
-    综合分析市场 (结合多周期)
+    综合分析市场 (结合多周期 + 置信度评分系统)
     策略逻辑:
-    1. 全局趋势: 4H EMA判断大方向 (顺势而为)
-    2. 技术面: 15m RSI + MACD 寻找入场点
-    3. 资金面: 订单流Delta + 盘口失衡 确认突破
+    1. 计算多维度得分 (Trend, Flow, Technical)
+    2. 只有总分超过阈值 (如75分) 才开单
     """
     signal = 'hold'
+    score = 0
     reason = []
 
+    # 提取数据
     rsi = price_data['technical']['rsi']
     macd = price_data['technical']['macd']
     macd_signal = price_data['technical']['macd_signal']
     
-    delta = order_flow_metrics.get('delta_1m', 0)
+    delta_1m = order_flow_metrics.get('delta_1m', 0)
+    delta_5m = order_flow_metrics.get('delta_5m', 0)
     imbalance = order_flow_metrics.get('imbalance', 0)
     
     trend = trend_data['trend']
+    
+    # 权重配置
+    W = TRADE_CONFIG['weights']
     
     # 阈值
     rsi_high = TRADE_CONFIG['rsi_overbought']
     rsi_low = TRADE_CONFIG['rsi_oversold']
 
-    # --- 做多逻辑 ---
-    # 1. 大趋势看涨
-    # 2. 技术面: RSI < 70 且 MACD 金叉
-    # 3. 资金面: 主动买入 (Delta > 0)
+    # --- 评分逻辑 ---
+    
+    # 1. 趋势得分 (基础分)
+    trend_score = 0
+    trend_direction = 'neutral'
+    
     if trend == 'bullish':
-        tech_long = rsi < rsi_high and macd > macd_signal
-        flow_long = delta > 0 and imbalance > 0.1
-        
-        if tech_long and flow_long:
-            signal = 'buy'
-            reason.append(f"大趋势看涨(>EMA{TRADE_CONFIG['trend_ema_period']})")
-            reason.append(f"RSI({rsi:.1f})健康")
-            reason.append("MACD金叉")
-            reason.append(f"资金流配合(Delta:{delta:.0f})")
-
-    # --- 做空逻辑 ---
-    # 1. 大趋势看跌
-    # 2. 技术面: RSI > 30 且 MACD 死叉
-    # 3. 资金面: 主动卖出 (Delta < 0)
+        trend_score = W['trend']
+        trend_direction = 'long'
+        reason.append(f"大趋势看涨(+{W['trend']})")
     elif trend == 'bearish':
-        tech_short = rsi > rsi_low and macd < macd_signal
-        flow_short = delta < 0 and imbalance < -0.1
+        trend_score = W['trend']
+        trend_direction = 'short'
+        reason.append(f"大趋势看跌(+{W['trend']})")
         
-        if tech_short and flow_short:
-            signal = 'sell'
-            reason.append(f"大趋势看跌(<EMA{TRADE_CONFIG['trend_ema_period']})")
-            reason.append(f"RSI({rsi:.1f})健康")
-            reason.append("MACD死叉")
-            reason.append(f"资金流配合(Delta:{delta:.0f})")
+    # 如果没有明确趋势，分数很难达标，后续逻辑基于趋势方向展开
+    
+    # 2. 资金流得分 (Delta)
+    flow_score = 0
+    if trend_direction == 'long':
+        if delta_1m > 0 and delta_5m > 0:
+            flow_score = W['delta']
+            reason.append(f"资金流强劲买入(+{W['delta']})")
+        elif delta_1m > 0:
+            flow_score = W['delta'] * 0.6 # 只有1m配合
+            reason.append(f"短时买入(+{int(W['delta']*0.6)})")
+    elif trend_direction == 'short':
+        if delta_1m < 0 and delta_5m < 0:
+            flow_score = W['delta']
+            reason.append(f"资金流强劲卖出(+{W['delta']})")
+        elif delta_1m < 0:
+            flow_score = W['delta'] * 0.6
+            reason.append(f"短时卖出(+{int(W['delta']*0.6)})")
+            
+    # 3. 盘口得分 (Imbalance)
+    book_score = 0
+    if trend_direction == 'long' and imbalance > 0.05:
+        book_score = W['imbalance']
+        reason.append(f"盘口支撑(+{W['imbalance']})")
+    elif trend_direction == 'short' and imbalance < -0.05:
+        book_score = W['imbalance']
+        reason.append(f"盘口压制(+{W['imbalance']})")
+        
+    # 4. 动能得分 (MACD)
+    macd_score = 0
+    if trend_direction == 'long' and macd > macd_signal:
+        macd_score = W['macd']
+        reason.append(f"MACD金叉(+{W['macd']})")
+    elif trend_direction == 'short' and macd < macd_signal:
+        macd_score = W['macd']
+        reason.append(f"MACD死叉(+{W['macd']})")
+        
+    # 5. 震荡得分 (RSI) - 顺势操作中，RSI不超买/超卖即可给分
+    rsi_score = 0
+    if trend_direction == 'long':
+        if rsi < rsi_high: # 未超买，有上涨空间
+            rsi_score = W['rsi']
+            reason.append(f"RSI健康(+{W['rsi']})")
+    elif trend_direction == 'short':
+        if rsi > rsi_low: # 未超卖，有下跌空间
+            rsi_score = W['rsi']
+            reason.append(f"RSI健康(+{W['rsi']})")
 
-    return signal, ", ".join(reason)
+    # --- 汇总得分 ---
+    score = trend_score + flow_score + book_score + macd_score + rsi_score
+    
+    # 决策
+    if score >= TRADE_CONFIG['confidence_threshold']:
+        if trend_direction == 'long':
+            signal = 'buy'
+        elif trend_direction == 'short':
+            signal = 'sell'
+            
+    return signal, score, ", ".join(reason)
 
 # 实盘/Testnet 状态追踪器 (用于记录最高/最低价以实现追踪止盈)
 REAL_POS_TRACKER = {
@@ -648,17 +721,21 @@ def run_strategy_loop():
                     signal = 'hold'
                     reason = []
                 else:
-                    signal, reason = analyze_market(price_data, of_metrics, trend_data)
+                    signal, score, reason = analyze_market(price_data, of_metrics, trend_data)
                 
+                # 打印分析结果 (可选)
+                if score > 0:
+                    print(f"   📊 信号分析: {signal.upper()} | 得分: {score}/{TRADE_CONFIG['confidence_threshold']} | 理由: {reason}")
+
                 if signal == 'buy':
-                    log_and_notify(f"� [买入信号] {reason} @ {current_price:.1f}")
+                    log_and_notify(f"🟢 [买入信号] 得分:{score} | {reason} @ {current_price:.1f}")
                     if RUN_MODE == 'LOCAL_SIMULATION':
                         virtual_account.open_position('long', current_price, TRADE_CONFIG['position_size_usdt'], timestamp)
                     else:
                         execute_exchange_order('long', current_price, TRADE_CONFIG['position_size_usdt'])
                 
                 elif signal == 'sell':
-                    log_and_notify(f"🔴 [卖出信号] {reason} @ {current_price:.1f}")
+                    log_and_notify(f"🔴 [卖出信号] 得分:{score} | {reason} @ {current_price:.1f}")
                     if RUN_MODE == 'LOCAL_SIMULATION':
                         virtual_account.open_position('short', current_price, TRADE_CONFIG['position_size_usdt'], timestamp)
                     else:
