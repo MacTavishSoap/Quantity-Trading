@@ -342,10 +342,21 @@ def setup_exchange():
                     # acctLv: 1: Simple, 2: Single-currency margin, 3: Multi-currency margin, 4: Portfolio
                     if str(acct_lv) == '1':
                         print("\n❌❌❌ 严重错误: 账户模式为 '简单模式' (Simple Mode) ❌❌❌")
-                        print("此模式不支持合约交易/杠杆交易。")
-                        print("请务必前往 OKX 网页端或 App 修改账户设置为 '单币种保证金' (Single-currency margin) 或更高模式。")
-                        print("操作路径: 交易设置 -> 账户模式 -> 单币种保证金模式")
-                        print("程序将继续尝试运行，但下单可能会失败。\n")
+                        print("⚠️ 此模式不支持合约交易。正在尝试自动升级账户模式为 '单币种保证金' (Level 2)...")
+                        try:
+                            # 尝试自动升级账户模式
+                            exchange.private_post_account_set_account_level({'acctLv': '2'})
+                            print("✅ 自动升级成功！账户模式已切换为 '单币种保证金'。")
+                            # 重新获取配置确认
+                            time.sleep(1)
+                            acc_config = exchange.private_get_account_config()
+                            new_lv = acc_config['data'][0]['acctLv']
+                            print(f"ℹ️ 当前账户模式等级: {new_lv}")
+                        except Exception as upgrade_error:
+                            print(f"❌ 自动升级失败: {upgrade_error}")
+                            print("请务必前往 OKX 网页端或 App 手动修改账户设置。")
+                            print("操作路径: 交易设置 -> 账户模式 -> 单币种保证金模式")
+                            print("程序将继续尝试运行，但下单可能会失败。\n")
             except Exception as e:
                 print(f"⚠️ 无法获取账户配置信息: {e}")
 
