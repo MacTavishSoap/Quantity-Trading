@@ -60,16 +60,7 @@ else:
         print("🔑 加载 OKX 实盘 Key 用于本地模拟行情获取")
 
 # 代理配置
-# 优先尝试本地常用代理端口
-USE_PROXY = True
-if USE_PROXY:
-    exchange_config['proxies'] = {
-        'http': 'http://127.0.0.1:7890',
-        'https': 'http://127.0.0.1:7890',
-    }
-    print("🌐 使用本地代理: http://127.0.0.1:7890")
-else:
-    print("🌐 直连模式 (无代理)")
+print("🌐 直连模式 (无代理)")
 
 # WebSocket 配置
 USE_WEBSOCKET = True  # 启用 WebSocket 获取实时订单流数据

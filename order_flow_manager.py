@@ -39,8 +39,8 @@ class OrderFlowManager:
             self.proxy_host = proxy_host
             self.proxy_port = proxy_port
         else:
-            self.proxy_host = "127.0.0.1" if (os.getenv("USE_PROXY", "false").lower() == "true") else None
-            self.proxy_port = 7890 if self.proxy_host else None
+            self.proxy_host = None
+            self.proxy_port = None
             
         # 移除代理认证 (如果不需要)
         # self.proxy_auth = None
