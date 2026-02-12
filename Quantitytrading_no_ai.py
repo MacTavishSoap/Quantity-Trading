@@ -6,6 +6,7 @@ import requests
 from dotenv import load_dotenv
 from datetime import datetime
 from order_flow_manager import OrderFlowManager
+from ml_noise_filter import MarketNoiseFilter
 
 # 加载环境变量
 load_dotenv()
@@ -16,8 +17,9 @@ load_dotenv()
 
 # 运行模式配置# 运行模式配置
 # 可选值: 'LOCAL_SIMULATION' (本地模拟), 'OKX_TESTNET' (OKX模拟盘), 'REAL_TRADING' (实盘)
-RUN_MODE = 'OKX_TESTNET' 
+RUN_MODE = 'REAL_TRADING' 
 DRY_RUN = (RUN_MODE == 'LOCAL_SIMULATION')
+SAFE_MODE = True # 安全模式：禁止真实下单
 
 # Telegram配置
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN') or os.getenv('TELEGRAM_BOT_TOKEN')
@@ -59,7 +61,7 @@ else:
 
 # 代理配置
 # 优先尝试本地常用代理端口
-USE_PROXY = False
+USE_PROXY = True
 if USE_PROXY:
     exchange_config['proxies'] = {
         'http': 'http://127.0.0.1:7890',
@@ -101,11 +103,12 @@ TRADE_CONFIG = {
     # 信号置信度参数
     'confidence_threshold': 75,      # 开单所需最低置信度分数 (0-100)
     'weights': {
-        'trend': 30,         # 趋势权重 (大方向)
-        'delta': 25,         # 资金流权重 (短期爆发)
+        'trend': 20,         # 趋势权重 (大方向)
+        'zone': 25,          # 供需区权重 (位置)
+        'delta': 20,         # 资金流权重 (短期爆发)
         'imbalance': 15,     # 盘口权重 (支撑/阻力)
-        'macd': 15,          # 动能权重
-        'rsi': 15            # 震荡指标权重
+        'macd': 10,          # 动能权重
+        'rsi': 10            # 震荡指标权重
     },
     
     # 趋势分析参数
@@ -213,6 +216,9 @@ class VirtualAccount:
 # 全局模拟账户
 virtual_account = VirtualAccount()
 
+# 市场噪音过滤器
+noise_filter = MarketNoiseFilter()
+
 # ==========================================
 # 3.b 实盘/Testnet 交易辅助函数
 # ==========================================
@@ -231,15 +237,19 @@ def get_exchange_position():
                     'entry_price': float(pos['entryPrice']),
                     'contracts': float(pos['contracts']),
                     'unrealized_pnl': float(pos['unrealizedPnl']),
-                    'entry_time': datetime.fromtimestamp(int(pos['updatedTime'])/1000).strftime('%H:%M:%S')
+                    'entry_time': datetime.fromtimestamp(int(pos['timestamp'])/1000).strftime('%H:%M:%S') if 'timestamp' in pos else 'N/A'
                 }
         return None
     except Exception as e:
-        print(f"⚠️ 获取持仓失败: {e}")
+        # print(f"⚠️ 获取持仓失败: {e}")  # 暂时屏蔽频繁报错
         return None
 
 def execute_exchange_order(side, price, size_usdt):
     """执行交易所订单"""
+    if SAFE_MODE:
+        log_and_notify(f"🛡️ [安全模式] 拦截真实下单: {side.upper()} @ {price} | 价值: {size_usdt} U")
+        return True
+
     try:
         # 计算张数
         contract_size = TRADE_CONFIG['contract_size']
@@ -273,6 +283,10 @@ def execute_exchange_order(side, price, size_usdt):
 
 def close_exchange_position(position_info):
     """平仓"""
+    if SAFE_MODE:
+        log_and_notify(f"🛡️ [安全模式] 拦截真实平仓: {position_info['side'].upper()} | 数量: {position_info['contracts']} 张")
+        return True
+
     try:
         side = position_info['side'] # long or short
         contracts = int(position_info['contracts'])
@@ -424,7 +438,7 @@ def get_btc_ohlcv_enhanced():
         return None
 
 def get_trend_data():
-    """获取大周期趋势数据 (全局战略视角)"""
+    """获取大周期趋势数据 (全局战略视角 - 增强版)"""
     try:
         # 获取大周期K线
         ohlcv = exchange.fetch_ohlcv(TRADE_CONFIG['symbol'], TRADE_CONFIG['trend_timeframe'], limit=TRADE_CONFIG['trend_ema_period'] + 10)
@@ -434,33 +448,119 @@ def get_trend_data():
         df['ema_trend'] = df['close'].ewm(span=TRADE_CONFIG['trend_ema_period'], adjust=False).mean()
         
         current = df.iloc[-1]
-        trend = 'bullish' if current['close'] > current['ema_trend'] else 'bearish'
+        ema_last = current['ema_trend']
+        
+        # 计算EMA斜率 (取最近3根K线的变化率)
+        # 避免单根K线的噪音
+        if len(df) >= 3:
+            ema_prev = df['ema_trend'].iloc[-3]
+            # 斜率 = (当前EMA - 前2根EMA) / 前2根EMA
+            slope = (ema_last - ema_prev) / ema_prev
+        else:
+            slope = 0
+
+        # 定义趋势强度阈值 (0.1% 的变化)
+        slope_threshold = 0.001
+        
+        trend_state = 'NEUTRAL'
+        current_price = current['close']
+        
+        # 判定逻辑: 价格位置 + EMA方向
+        if current_price > ema_last:
+            if slope > slope_threshold:
+                trend_state = 'STRONG_BULL' # 价格在EMA之上且EMA强劲上扬
+            elif slope > 0:
+                trend_state = 'WEAK_BULL'   # 价格在EMA之上且EMA缓慢上扬
+            else:
+                trend_state = 'POSSIBLE_REVERSAL_TOP' # 价格在EMA之上但EMA开始下跌 (顶背离/减速)
+        else:
+            if slope < -slope_threshold:
+                trend_state = 'STRONG_BEAR' # 价格在EMA之下且EMA强劲下跌
+            elif slope < 0:
+                trend_state = 'WEAK_BEAR'   # 价格在EMA之下且EMA缓慢下跌
+            else:
+                trend_state = 'POSSIBLE_REVERSAL_BOTTOM' # 价格在EMA之下但EMA开始上涨 (底背离/减速)
         
         return {
-            'trend': trend,
-            'ema': current['ema_trend'],
+            'trend': trend_state,
+            'ema': ema_last,
+            'slope': slope,
             'price': current['close']
         }
     except Exception as e:
         print(f"⚠️ 获取趋势数据失败: {e}")
-        return {'trend': 'neutral', 'ema': 0, 'price': 0}
+        return {'trend': 'NEUTRAL', 'ema': 0, 'slope': 0, 'price': 0}
+
+def get_supply_demand_zones(df):
+    """
+    计算供给区和需求区
+    逻辑: 寻找大阳线/大阴线前的盘整区 (Base)
+    - 需求区 (Demand): 强劲上涨前的区域
+    - 供给区 (Supply): 强劲下跌前的区域
+    """
+    zones = []
+    atr = df['atr'].iloc[-1]
+    
+    # 简单算法: 遍历最近50根K线
+    for i in range(len(df) - 50, len(df) - 1):
+        if i < 1: continue
+        
+        curr = df.iloc[i]
+        prev = df.iloc[i-1]
+        
+        body_size = abs(curr['close'] - curr['open'])
+        
+        # 识别"爆发K线" (Body > 1.5 * ATR)
+        if body_size > 1.5 * atr:
+            # 1. 需求区: 大阳线
+            if curr['close'] > curr['open']:
+                # 区域定义: 前一根K线的最低价到最高价
+                zone_top = prev['high']
+                zone_bottom = prev['low']
+                zones.append({
+                    'type': 'demand',
+                    'top': zone_top,
+                    'bottom': zone_bottom,
+                    'created_at': df.iloc[i]['timestamp']
+                })
+            # 2. 供给区: 大阴线
+            elif curr['close'] < curr['open']:
+                # 区域定义: 前一根K线的最低价到最高价
+                zone_top = prev['high']
+                zone_bottom = prev['low']
+                zones.append({
+                    'type': 'supply',
+                    'top': zone_top,
+                    'bottom': zone_bottom,
+                    'created_at': df.iloc[i]['timestamp']
+                })
+    
+    # 过滤掉已经被击穿的区域 (简化版: 只保留最近的)
+    valid_zones = []
+    current_price = df['close'].iloc[-1]
+    
+    for zone in reversed(zones): # 从最新往回找
+        # 简单过滤: 只保留最近的3个有效区域
+        if len(valid_zones) >= 6: break
+        valid_zones.append(zone)
+            
+    return valid_zones
 
 # ==========================================
 # 4. 策略逻辑
 # ==========================================
 
-def analyze_market(price_data, order_flow_metrics, trend_data):
+def analyze_market(price_data, order_flow_metrics, trend_data, noise_state):
     """
-    综合分析市场 (结合多周期 + 置信度评分系统)
-    策略逻辑:
-    1. 计算多维度得分 (Trend, Flow, Technical)
-    2. 只有总分超过阈值 (如75分) 才开单
+    综合分析市场 (结合供需区 + 多周期 + 置信度评分系统 + 噪音状态)
     """
     signal = 'hold'
     score = 0
     reason = []
 
     # 提取数据
+    current_price = price_data['price']
+    df = price_data['df']
     rsi = price_data['technical']['rsi']
     macd = price_data['technical']['macd']
     macd_signal = price_data['technical']['macd_signal']
@@ -471,40 +571,125 @@ def analyze_market(price_data, order_flow_metrics, trend_data):
     
     trend = trend_data['trend']
     
+    # --- 1. 宏观方向过滤 (Gatekeeper) ---
+    # 结合 大周期趋势 (Trend) + 市场噪音状态 (Noise)
+    allowed_direction = 'BOTH'
+    regime_msg = ""
+    
+    if 'BULL' in trend:
+        if 'STRONG' in trend and noise_state == 'TRENDING':
+            allowed_direction = 'LONG_ONLY'
+            regime_msg = "🚀单边牛市"
+        elif noise_state == 'RANGING':
+            allowed_direction = 'LONG_ONLY' # 牛市震荡，只接多
+            regime_msg = "📈牛市震荡(只多)"
+    elif 'BEAR' in trend:
+        if 'STRONG' in trend and noise_state == 'TRENDING':
+            allowed_direction = 'SHORT_ONLY'
+            regime_msg = "📉单边熊市"
+        elif noise_state == 'RANGING':
+            allowed_direction = 'SHORT_ONLY' # 熊市震荡，只空
+            regime_msg = "📉熊市震荡(只空)"
+            
+    if regime_msg:
+        reason.append(f"宏观:{regime_msg}")
+
+    # 0. 计算供需区
+    zones = get_supply_demand_zones(df)
+    
     # 权重配置
     W = TRADE_CONFIG['weights']
     
-    # 阈值
-    rsi_high = TRADE_CONFIG['rsi_overbought']
-    rsi_low = TRADE_CONFIG['rsi_oversold']
+    # --- 动态阈值与权重调整 (基于噪音状态) ---
+    
+    # 默认阈值
+    rsi_high = TRADE_CONFIG['rsi_overbought'] # 70
+    rsi_low = TRADE_CONFIG['rsi_oversold']    # 30
+    
+    # 状态调整
+    if noise_state == 'TRENDING':
+        # 趋势市: RSI 阈值外扩，防止过早离场
+        rsi_high = 80 
+        rsi_low = 20
+        # 增加趋势权重，减少震荡指标权重
+        W = W.copy()
+        W['trend'] += 10
+        W['rsi'] -= 5
+        # reason.append("🌊趋势模式:权重调整")
+        
+    elif noise_state == 'RANGING':
+        # 震荡市: RSI 阈值内缩，灵敏捕捉反转
+        rsi_high = 65
+        rsi_low = 35
+        # 增加震荡指标权重
+        W = W.copy()
+        W['rsi'] += 10
+        W['zone'] += 5
+        W['trend'] -= 10
+        # reason.append("〰️震荡模式:权重调整")
+        
+    elif noise_state == 'CHAOTIC':
+        # 混乱市: 严格防御
+        return 'hold', 0, "⛔混乱行情-禁止开仓"
 
     # --- 评分逻辑 ---
     
-    # 1. 趋势得分 (基础分)
+    # 1. 供需区得分 (Zone Score) - 核心驱动
+    zone_score = 0
+    in_demand = False
+    in_supply = False
+    
+    for zone in zones:
+        # 检查是否在需求区附近 (价格在区域内或上方一点点)
+        if zone['type'] == 'demand':
+            if zone['bottom'] <= current_price <= zone['top'] * 1.002: # 允许0.2%误差
+                in_demand = True
+                zone_score = W['zone']
+                reason.append(f"触及需求区[{zone['bottom']:.1f}-{zone['top']:.1f}](+{W['zone']})")
+                break
+        # 检查是否在供给区附近
+        elif zone['type'] == 'supply':
+            if zone['bottom'] * 0.998 <= current_price <= zone['top']:
+                in_supply = True
+                zone_score = W['zone']
+                reason.append(f"触及供给区[{zone['bottom']:.1f}-{zone['top']:.1f}](+{W['zone']})")
+                break
+    
+    # 2. 趋势得分 (Trend Score)
     trend_score = 0
     trend_direction = 'neutral'
     
-    if trend == 'bullish':
+    if 'BULL' in trend:
         trend_score = W['trend']
         trend_direction = 'long'
-        reason.append(f"大趋势看涨(+{W['trend']})")
-    elif trend == 'bearish':
+        if 'STRONG' in trend:
+             trend_score *= 1.2 # 强趋势加分
+             reason.append("🔥强多头")
+        else:
+             reason.append("↗️弱多头")
+             
+    elif 'BEAR' in trend:
         trend_score = W['trend']
         trend_direction = 'short'
-        reason.append(f"大趋势看跌(+{W['trend']})")
-        
-    # 如果没有明确趋势，分数很难达标，后续逻辑基于趋势方向展开
-    
-    # 2. 资金流得分 (Delta)
+        if 'STRONG' in trend:
+             trend_score *= 1.2
+             reason.append("🔥强空头")
+        else:
+             reason.append("↘️弱空头")
+
+    # 3. 资金流得分 (Delta)
     flow_score = 0
-    if trend_direction == 'long':
+    # 做多逻辑: 在需求区 或 顺势
+    if (in_demand or trend_direction == 'long') and not in_supply:
         if delta_1m > 0 and delta_5m > 0:
             flow_score = W['delta']
             reason.append(f"资金流强劲买入(+{W['delta']})")
         elif delta_1m > 0:
-            flow_score = W['delta'] * 0.6 # 只有1m配合
+            flow_score = W['delta'] * 0.6
             reason.append(f"短时买入(+{int(W['delta']*0.6)})")
-    elif trend_direction == 'short':
+            
+    # 做空逻辑: 在供给区 或 顺势
+    if (in_supply or trend_direction == 'short') and not in_demand:
         if delta_1m < 0 and delta_5m < 0:
             flow_score = W['delta']
             reason.append(f"资金流强劲卖出(+{W['delta']})")
@@ -512,45 +697,126 @@ def analyze_market(price_data, order_flow_metrics, trend_data):
             flow_score = W['delta'] * 0.6
             reason.append(f"短时卖出(+{int(W['delta']*0.6)})")
             
-    # 3. 盘口得分 (Imbalance)
+    # 4. 盘口得分 (Imbalance)
     book_score = 0
-    if trend_direction == 'long' and imbalance > 0.05:
-        book_score = W['imbalance']
-        reason.append(f"盘口支撑(+{W['imbalance']})")
-    elif trend_direction == 'short' and imbalance < -0.05:
-        book_score = W['imbalance']
-        reason.append(f"盘口压制(+{W['imbalance']})")
+    if imbalance > 0.05: # 买单多
+        if in_demand or trend_direction == 'long':
+            book_score = W['imbalance']
+            reason.append(f"盘口支撑(+{W['imbalance']})")
+    elif imbalance < -0.05: # 卖单多
+        if in_supply or trend_direction == 'short':
+            book_score = W['imbalance']
+            reason.append(f"盘口压制(+{W['imbalance']})")
         
-    # 4. 动能得分 (MACD)
+    # 5. 动能得分 (MACD)
     macd_score = 0
-    if trend_direction == 'long' and macd > macd_signal:
-        macd_score = W['macd']
-        reason.append(f"MACD金叉(+{W['macd']})")
-    elif trend_direction == 'short' and macd < macd_signal:
-        macd_score = W['macd']
-        reason.append(f"MACD死叉(+{W['macd']})")
-        
-    # 5. 震荡得分 (RSI) - 顺势操作中，RSI不超买/超卖即可给分
+    if macd > macd_signal: # 金叉
+        if in_demand or trend_direction == 'long':
+            macd_score = W['macd']
+            reason.append(f"MACD金叉(+{W['macd']})")
+    elif macd < macd_signal: # 死叉
+        if in_supply or trend_direction == 'short':
+            macd_score = W['macd']
+            reason.append(f"MACD死叉(+{W['macd']})")
+            
+    # 6. 震荡得分 (RSI) - 仅作为过滤
     rsi_score = 0
-    if trend_direction == 'long':
-        if rsi < rsi_high: # 未超买，有上涨空间
+    if 40 <= rsi <= 60:
+        rsi_score = W['rsi'] * 0.5 # 中性区间给一半分
+    elif rsi < 40: # 超卖
+        if in_demand or trend_direction == 'long':
             rsi_score = W['rsi']
-            reason.append(f"RSI健康(+{W['rsi']})")
-    elif trend_direction == 'short':
-        if rsi > rsi_low: # 未超卖，有下跌空间
+            reason.append(f"RSI超卖回升(+{W['rsi']})")
+    elif rsi > 60: # 超买
+        if in_supply or trend_direction == 'short':
             rsi_score = W['rsi']
-            reason.append(f"RSI健康(+{W['rsi']})")
+            reason.append(f"RSI超买回调(+{W['rsi']})")
 
     # --- 汇总得分 ---
-    score = trend_score + flow_score + book_score + macd_score + rsi_score
     
-    # 决策
-    if score >= TRADE_CONFIG['confidence_threshold']:
-        if trend_direction == 'long':
-            signal = 'buy'
-        elif trend_direction == 'short':
-            signal = 'sell'
+    # 计算多头总分
+    long_total_score = 0
+    if in_demand or trend_direction == 'long':
+        long_total_score = (trend_score if trend_direction == 'long' else 0) + \
+                           (zone_score if in_demand else 0) + \
+                           (flow_score if delta_1m > 0 else 0) + \
+                           (book_score if imbalance > 0 else 0) + \
+                           (macd_score if macd > macd_signal else 0) + \
+                           (rsi_score if rsi < 60 else 0)
+
+    # 计算空头总分
+    short_total_score = 0
+    if in_supply or trend_direction == 'short':
+        short_total_score = (trend_score if trend_direction == 'short' else 0) + \
+                            (zone_score if in_supply else 0) + \
+                            (flow_score if delta_1m < 0 else 0) + \
+                            (book_score if imbalance < 0 else 0) + \
+                            (macd_score if macd < macd_signal else 0) + \
+                            (rsi_score if rsi > 40 else 0)
+
+    # 阈值判定
+    threshold = TRADE_CONFIG['confidence_threshold']
+    
+    signal = 'hold'
+    score = 0
+    
+    if long_total_score >= threshold and long_total_score > short_total_score:
+        signal = 'buy'
+        score = int(long_total_score)
+    elif short_total_score >= threshold and short_total_score > long_total_score:
+        signal = 'sell'
+        score = int(short_total_score)
+    else:
+        signal = 'hold'
+        score = int(max(long_total_score, short_total_score))
+        
+    # 如果分数很高但方向矛盾，保持hold
+    if in_demand and in_supply: # 极小概率
+        signal = 'hold'
+        score = 0
+        reason.append("同时处于供需区(矛盾)")
+
+    # --- 噪音过滤 & 宏观拦截 ---
+    state = noise_state
+    
+    # 根据市场状态动态调整信号逻辑
+    if state == 'CHAOTIC':
+        # 极度混乱，直接拦截
+        if score > 0:
+            score = 0
+            signal = 'hold'
+            reason.append(f"⛔混乱行情拦截")
             
+    elif state == 'RANGING':
+        # 震荡市: RSI 和 供需区 最有效，趋势指标失效
+        if trend_score > 0:
+            score -= int(trend_score * 0.8) # 削弱趋势分
+            reason.append(f"📉震荡市削弱趋势分")
+            
+        if rsi_score > 0:
+            score += 10 # 奖励 RSI
+            reason.append(f"📈震荡市RSI加权")
+            
+    elif state == 'TRENDING':
+        # 趋势市: 趋势指标 最有效
+        if rsi_score > 0: 
+            score -= rsi_score # 去掉 RSI 得分 (防止逆势摸顶/抄底)
+            reason.append(f"📉强趋势忽略RSI反转")
+            
+        if trend_score > 0:
+            score += 10 # 奖励顺势
+            reason.append(f"📈强趋势顺势加权")
+
+    # --- 最终宏观方向拦截 (Final Gatekeeper) ---
+    if signal == 'buy':
+        if allowed_direction == 'SHORT_ONLY':
+            signal = 'hold'
+            reason.append(f"⛔宏观趋势拦截看多({regime_msg})")
+    elif signal == 'sell':
+        if allowed_direction == 'LONG_ONLY':
+            signal = 'hold'
+            reason.append(f"⛔宏观趋势拦截看空({regime_msg})")
+
     return signal, score, ", ".join(reason)
 
 # 实盘/Testnet 状态追踪器 (用于记录最高/最低价以实现追踪止盈)
@@ -669,6 +935,8 @@ def run_strategy_loop():
         print("⚠️ 请确保 .env 中配置了 Testnet API Key")
     else:
         print("⚠️⚠️⚠️ 当前模式: 实盘交易 (Real Trading) ⚠️⚠️⚠️")
+        if SAFE_MODE:
+             print("🛡️ 安全模式已开启: 真实交易将被拦截")
         print("请确保您已充分了解风险！")
 
     # 初始化订单流管理器
@@ -712,7 +980,28 @@ def run_strategy_loop():
             delta = of_metrics.get('delta_1m', 0)
             trend_str = f"{trend_data['trend'].upper()} (EMA:{trend_data['ema']:.1f})"
             
-            print(f"[{timestamp}] 价格:{current_price:.1f} | 趋势:{trend_str} | RSI:{rsi:.1f} | Delta:{delta:.2f}")
+            # 计算噪音 (用于显示)
+            noise_res = noise_filter.analyze(price_data['df'])
+            noise_state = noise_res['state']
+            noise_icon = {
+                'TRENDING': '🚀', 
+                'RANGING': '〰️', 
+                'CHAOTIC': '⚠️', 
+                'NEUTRAL': '✅'
+            }.get(noise_state, '❓')
+            
+            ci_val = noise_res['features']['choppiness_index']
+            
+            print(f"[{timestamp}] 价格:{current_price:.1f} | 趋势:{trend_str} | Delta:{delta:.2f} | {noise_icon}{noise_state}(CI:{ci_val:.1f})")
+            
+            # 显示当前状态下的可信指标
+            valid_indicators = {
+                'TRENDING': '趋势(Trend), MACD, 资金流(Delta)',
+                'RANGING': '震荡(RSI), 供需区(Zones), 盘口(Imbalance)',
+                'CHAOTIC': '无 (市场噪音过大)',
+                'NEUTRAL': '综合参考所有指标'
+            }.get(noise_state, '综合参考')
+            print(f"   ℹ️  当前可信信号源: {valid_indicators}")
 
             # 3. 风险管理 (检查现有持仓)
             if check_risk_management(current_price, timestamp):
@@ -732,7 +1021,7 @@ def run_strategy_loop():
                     signal = 'hold'
                     reason = []
                 else:
-                    signal, score, reason = analyze_market(price_data, of_metrics, trend_data)
+                    signal, score, reason = analyze_market(price_data, of_metrics, trend_data, noise_state)
                 
                 # 打印分析结果 (可选)
                 if score > 0:
