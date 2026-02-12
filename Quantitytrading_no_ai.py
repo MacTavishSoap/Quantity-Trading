@@ -938,8 +938,8 @@ def run_strategy_loop():
         TRADE_CONFIG['symbol'], 
         use_ws=USE_WEBSOCKET, 
         is_sandbox=is_sandbox,
-        proxy_host='127.0.0.1' if USE_PROXY else None,
-        proxy_port=7890 if USE_PROXY else None
+        proxy_host=None,
+        proxy_port=None
     )
     
     # 等待 WebSocket 数据预热
